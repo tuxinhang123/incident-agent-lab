@@ -6,6 +6,7 @@ COMPOSE := docker compose -f deploy/compose.yaml
 
 build:
 	$(GO) build -o bin/demo-api ./cmd/demo-api
+	$(GO) build -o bin/agent ./cmd/agent
 
 test:
 	$(GO) test $(GOFLAGS_TEST) ./...

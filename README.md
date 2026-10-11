@@ -62,6 +62,26 @@ make fault-recover      # docker compose start redis
 make down
 ```
 
+## 诊断工具（Day 2）
+
+三个只读工具通过 agent CLI 调用，不开放任意 shell。每次调用都会向 `.run/tool-calls.jsonl` 追加一条审计记录（run_id、入参、耗时、错误类型、结果）。
+
+```bash
+make build
+
+# 接口检查：状态码 / 延迟 / 响应摘要（5xx 是正常结果而非工具错误）
+./bin/agent check-http -url http://localhost:8080/ready
+./bin/agent check-http -url http://localhost:8080/api/data -timeout-ms 3000
+
+# 容器状态：status / running / exit_code / 时间信息
+./bin/agent container-status -container ial-redis
+
+# 服务日志：按 error_type 聚合数量与一条样例，不回吐原始日志
+./bin/agent service-logs -service ial-demo-api -tail 200
+```
+
+工具错误统一归类为：`timeout` / `connection_failed` / `container_not_found` / `docker_unavailable` / `invalid_input` / `internal_error`。所有工具都有超时（HTTP 默认 3s 上限 10s；docker 命令 5-8s）、输入校验与输出大小上限（body 摘要 200 字符、日志最多 20 个错误组）。
+
 ## 无 Docker 环境的本地方式
 
 需要本机已安装 Go 和 redis-server：
@@ -80,8 +100,8 @@ make test
 
 ## 路线图
 
-- Day 1（当前）：仓库、Go 服务 + Redis + Compose，稳定复现"Redis 停止"故障
-- Day 2：三个只读诊断工具（容器状态、服务日志、HTTP 检查）
+- Day 1：仓库、Go 服务 + Redis + Compose，稳定复现"Redis 停止"故障
+- Day 2（当前）：三个只读诊断工具（容器状态、日志聚合、HTTP 检查）+ CLI 与调用审计
 - Day 3-4：接入 Eino，固定顺序诊断工作流与结构化输出
 - Day 5：5 个离线评测 Case
 - Day 6-7：运行可观测性、文档与演示
