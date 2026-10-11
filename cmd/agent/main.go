@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -15,6 +16,15 @@ import (
 )
 
 const auditPath = ".run/tool-calls.jsonl"
+
+// errToolFailed marks a tool-level business failure whose structured
+// {ok:false} JSON was already written to stdout; the process must still
+// exit non-zero, without duplicating the error on stderr.
+var errToolFailed = errors.New("tool failed")
+
+// errUsage marks a flag/usage error. The flag package already printed the
+// error and usage to stderr, so main only sets exit code 2.
+var errUsage = errors.New("invalid usage")
 
 func main() {
 	if len(os.Args) < 2 {
@@ -40,7 +50,17 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	if err != nil {
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, errToolFailed):
+		// Structured {ok:false} JSON already emitted on stdout; do not
+		// duplicate the error on stderr.
+		os.Exit(1)
+	case errors.Is(err, errUsage):
+		// flag.Parse already printed the error and usage to stderr.
+		os.Exit(2)
+	default:
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
@@ -51,7 +71,7 @@ func runCheckHTTP(argv []string, runID string, audit *agent.AuditLog) error {
 	url := fs.String("url", "", "endpoint URL to GET (required)")
 	timeoutMS := fs.Int("timeout-ms", 3000, "request timeout in milliseconds (max 10000)")
 	if err := fs.Parse(argv); err != nil {
-		return err
+		return errUsage
 	}
 	in := tools.HTTPEndpointInput{URL: *url, TimeoutMS: *timeoutMS}
 	started := time.Now()
@@ -64,7 +84,7 @@ func runContainerStatus(argv []string, runID string, audit *agent.AuditLog) erro
 	fs := flag.NewFlagSet("container-status", flag.ContinueOnError)
 	name := fs.String("container", "", "docker container name (required)")
 	if err := fs.Parse(argv); err != nil {
-		return err
+		return errUsage
 	}
 	in := tools.ContainerStatusInput{Container: *name}
 	started := time.Now()
@@ -78,7 +98,7 @@ func runServiceLogs(argv []string, runID string, audit *agent.AuditLog) error {
 	service := fs.String("service", "", "container/service name (required)")
 	tail := fs.Int("tail", 200, "number of recent log lines (max 5000)")
 	if err := fs.Parse(argv); err != nil {
-		return err
+		return errUsage
 	}
 	in := tools.ServiceLogsInput{Service: *service, Tail: *tail}
 	started := time.Now()
@@ -95,11 +115,14 @@ func writeAudit(audit *agent.AuditLog, runID, tool string, args map[string]any, 
 
 func emit(result any, toolErr *model.ToolError) error {
 	if toolErr != nil {
-		return agent.EncodeJSON(os.Stdout, map[string]any{
+		if err := agent.EncodeJSON(os.Stdout, map[string]any{
 			"ok":         false,
 			"error_type": toolErr.Type,
 			"message":    toolErr.Message,
-		})
+		}); err != nil {
+			return err
+		}
+		return errToolFailed
 	}
 	return agent.EncodeJSON(os.Stdout, map[string]any{"ok": true, "result": result})
 }

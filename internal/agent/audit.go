@@ -40,7 +40,7 @@ func (l *AuditLog) Record(runID, tool string, args map[string]any, started time.
 	call := model.ToolCall{
 		RunID:     runID,
 		Tool:      tool,
-		Args:      args,
+		Args:      redactArgs(args),
 		StartedAt: started.UTC(),
 		LatencyMS: time.Since(started).Milliseconds(),
 		OK:        toolErr == nil,
@@ -49,7 +49,7 @@ func (l *AuditLog) Record(runID, tool string, args map[string]any, started time.
 		call.ErrorType = toolErr.Type
 	}
 	if result != nil {
-		raw, err := json.Marshal(result)
+		raw, err := json.Marshal(redactResult(result))
 		if err == nil {
 			call.Result = raw
 		}
