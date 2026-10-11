@@ -51,6 +51,26 @@ func TestSanitizeString(t *testing.T) {
 			in:   "https://example.com/?Token=abc&Secret=def",
 			want: "https://example.com/?Secret=%5BREDACTED%5D&Token=%5BREDACTED%5D",
 		},
+		{
+			name: "client_secret query redacted",
+			in:   "https://example.com/?client_secret=x&ok=1",
+			want: "https://example.com/?client_secret=%5BREDACTED%5D&ok=1",
+		},
+		{
+			name: "plain text key=value assignment redacted",
+			in:   "password=secret",
+			want: "password=[REDACTED]",
+		},
+		{
+			name: "quoted json-style assignment redacted",
+			in:   `{"client_secret": "abc"}`,
+			want: `{"client_secret":"[REDACTED]"}`,
+		},
+		{
+			name: "error message without assignment unchanged",
+			in:   "failed to connect to redis",
+			want: "failed to connect to redis",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -58,6 +78,86 @@ func TestSanitizeString(t *testing.T) {
 				t.Errorf("sanitizeString(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSanitizeStringSecurityCases(t *testing.T) {
+	cases := []struct {
+		name        string
+		in          string
+		mustContain []string
+		mustNotHave []string
+	}{
+		{
+			name:        "non-URL JSON string masks sensitive fields only",
+			in:          `{"access_token":"secret","ok":1}`,
+			mustContain: []string{`"access_token":"[REDACTED]"`, `"ok":1`},
+			mustNotHave: []string{"secret"},
+		},
+		{
+			name:        "malformed escape URL masks token",
+			in:          "https://host/%zz?token=secret",
+			mustContain: []string{"https://host/%zz", "token="},
+			mustNotHave: []string{"secret"},
+		},
+		{
+			name:        "unparsable URL masks token conservatively",
+			in:          "see https://host/%zz;token=leaked now",
+			mustContain: []string{"https://host/%zz", "token=[REDACTED]"},
+			mustNotHave: []string{"leaked"},
+		},
+		{
+			name:        "plain text client_secret and password masked",
+			in:          `password=secret then "client_secret": "abc" done`,
+			mustContain: []string{"password=[REDACTED]", `"client_secret": "[REDACTED]"`},
+			mustNotHave: []string{"password=secret", `"abc"`},
+		},
+		{
+			name:        "benign prose stays readable",
+			in:          "failed to connect to redis",
+			mustContain: []string{"failed to connect to redis"},
+			mustNotHave: []string{redactedValue},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeString(tc.in)
+			for _, want := range tc.mustContain {
+				if !strings.Contains(got, want) {
+					t.Errorf("sanitizeString(%q) = %q, want it to contain %q", tc.in, got, want)
+				}
+			}
+			for _, bad := range tc.mustNotHave {
+				if strings.Contains(got, bad) {
+					t.Errorf("sanitizeString(%q) = %q, must not contain %q", tc.in, got, bad)
+				}
+			}
+		})
+	}
+}
+
+func TestRedactValueSensitiveJSONFields(t *testing.T) {
+	in := map[string]any{
+		"client_id":     "cid-123",
+		"client_secret": "shh",
+		"nested": map[string]any{
+			"refresh_token": "rt",
+			"note":          "failed to connect to redis",
+		},
+	}
+	out := redactValue(in).(map[string]any)
+	if out["client_id"] != "cid-123" {
+		t.Errorf("non-secret client_id altered: %#v", out["client_id"])
+	}
+	if out["client_secret"] != redactedValue {
+		t.Errorf("client_secret not masked: %#v", out["client_secret"])
+	}
+	nested, _ := out["nested"].(map[string]any)
+	if nested["refresh_token"] != redactedValue {
+		t.Errorf("refresh_token not masked: %#v", nested["refresh_token"])
+	}
+	if nested["note"] != "failed to connect to redis" {
+		t.Errorf("benign note altered: %#v", nested["note"])
 	}
 }
 
