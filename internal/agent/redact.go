@@ -39,11 +39,14 @@ func redactArgs(args map[string]any) map[string]any {
 	if args == nil {
 		return nil
 	}
-	out := make(map[string]any, len(args))
-	for k, v := range args {
-		out[k] = redactValue(v)
+	// Route the whole map through redactValue so top-level keys participate
+	// in sensitive-key matching the same way as nested maps; otherwise a
+	// credential passed as a top-level audit arg (e.g. {"token": "..."})
+	// would keep its value.
+	if out, ok := redactValue(args).(map[string]any); ok {
+		return out
 	}
-	return out
+	return make(map[string]any, len(args))
 }
 
 // redactResult deeply scrubs a tool result before it is serialized into the
@@ -97,6 +100,14 @@ func redactValue(v any) any {
 // and free-text credential assignments. Strings without credentials are
 // returned unchanged.
 func sanitizeString(s string) string {
+	// Structured JSON payloads take precedence even when they contain "://"
+	// (e.g. a credential URL held under "access_token"): redactValue masks
+	// the whole value of sensitive keys, which URL-segment masking alone
+	// cannot guarantee. JSON that fails to decode falls through to the
+	// URL/text paths below.
+	if r, ok := redactJSONString(s); ok {
+		return r
+	}
 	if strings.Contains(s, "://") {
 		// Fast path: the whole string is a single URL.
 		if u, err := url.Parse(s); err == nil && isHTTPURL(u) {
@@ -111,19 +122,33 @@ func sanitizeString(s string) string {
 	return redactNonURLString(s)
 }
 
+// redactJSONString decodes a JSON object/array payload, redacts it
+// field-by-field and re-encodes it. The boolean is false when s is not a
+// JSON object/array or cannot be decoded, leaving the caller's fallback free
+// to handle it.
+func redactJSONString(s string) (string, bool) {
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		return "", false
+	}
+	var generic any
+	if err := json.Unmarshal([]byte(s), &generic); err != nil {
+		return "", false
+	}
+	raw, err := json.Marshal(redactValue(generic))
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
 // redactNonURLString scrubs strings without a URL scheme. Structured JSON
 // payloads are decoded and redacted field-by-field so non-sensitive fields
 // keep their values; other text gets conservative assignment masking that
 // does not depend on URL parsing.
 func redactNonURLString(s string) string {
-	trimmed := strings.TrimSpace(s)
-	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-		var generic any
-		if err := json.Unmarshal([]byte(s), &generic); err == nil {
-			if raw, err := json.Marshal(redactValue(generic)); err == nil {
-				return string(raw)
-			}
-		}
+	if r, ok := redactJSONString(s); ok {
+		return r
 	}
 	return redactSensitiveText(s)
 }
@@ -217,19 +242,31 @@ func redactParsedURL(u *url.URL) (string, bool) {
 		changed = true
 	}
 	if u.RawQuery != "" {
-		q := u.Query()
-		for key, vals := range q {
-			if !isSensitiveKey(key) {
-				continue
+		// ParseQuery (unlike URL.Query) surfaces malformed pairs instead of
+		// silently dropping them: bad percent-escapes and, on Go 1.17+,
+		// semicolon separators return an error together with the dropped
+		// pairs. Fall back to raw-text masking on error so credentials in
+		// malformed queries cannot pass through untouched.
+		q, err := url.ParseQuery(u.RawQuery)
+		queryChanged := false
+		if err == nil {
+			for key, vals := range q {
+				if !isSensitiveKey(key) {
+					continue
+				}
+				for i := range vals {
+					vals[i] = redactedValue
+				}
+				queryChanged = true
 			}
-			for i := range vals {
-				vals[i] = redactedValue
+			if queryChanged {
+				u.RawQuery = q.Encode()
 			}
-			changed = true
+		} else if masked := redactSensitiveText(u.RawQuery); masked != u.RawQuery {
+			u.RawQuery = masked
+			queryChanged = true
 		}
-		if changed {
-			u.RawQuery = q.Encode()
-		}
+		changed = changed || queryChanged
 	}
 	if !changed {
 		return "", false

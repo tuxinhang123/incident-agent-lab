@@ -118,6 +118,30 @@ func TestSanitizeStringSecurityCases(t *testing.T) {
 			mustContain: []string{"failed to connect to redis"},
 			mustNotHave: []string{redactedValue},
 		},
+		{
+			name:        "malformed percent escape in query masks token",
+			in:          "https://host/path?token=malformedsek%zz&q=1",
+			mustContain: []string{"https://host/path", "token=", redactedValue, "q=1"},
+			mustNotHave: []string{"malformedsek"},
+		},
+		{
+			name:        "semicolon separated query masks both credentials",
+			in:          "https://host/path?client_secret=cssek;token=tsek",
+			mustContain: []string{"https://host/path", "client_secret=", "token=", redactedValue},
+			mustNotHave: []string{"cssek", "tsek"},
+		},
+		{
+			name:        "JSON sensitive field with URL value is wholly redacted",
+			in:          `{"access_token":"https://svc:pw@host.internal/h?token=insideurlsek","ok":1}`,
+			mustContain: []string{`"access_token":"[REDACTED]"`, `"ok":1`},
+			mustNotHave: []string{"insideurlsek", "svc", "pw"},
+		},
+		{
+			name:        "JSON non-sensitive field keeps normal URL value",
+			in:          `{"ok":1,"url":"https://example.com/path?q=1"}`,
+			mustContain: []string{`"url":"https://example.com/path?q=1"`, `"ok":1`},
+			mustNotHave: []string{redactedValue},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -203,6 +227,38 @@ func TestRedactArgs(t *testing.T) {
 	// Original input must not be mutated.
 	if in["url"] != "https://alice:sekret@example.com/path?token=abc123&q=1" {
 		t.Errorf("input args were mutated: %q", in["url"])
+	}
+}
+
+func TestRedactArgsTopLevelSensitiveKeys(t *testing.T) {
+	in := map[string]any{
+		"token":         "x",
+		"client_secret": "y",
+		"nested":        map[string]any{"token": "z"},
+		"q":             "1",
+	}
+	out := redactArgs(in)
+
+	if out["token"] != redactedValue {
+		t.Errorf("top-level token not masked: %#v", out["token"])
+	}
+	if out["client_secret"] != redactedValue {
+		t.Errorf("top-level client_secret not masked: %#v", out["client_secret"])
+	}
+	nested, _ := out["nested"].(map[string]any)
+	if nested == nil || nested["token"] != redactedValue {
+		t.Errorf("nested token not masked: %#v", out["nested"])
+	}
+	if out["q"] != "1" {
+		t.Errorf("non-sensitive top-level value altered: %#v", out["q"])
+	}
+	// Original input must not be mutated.
+	if in["token"] != "x" || in["client_secret"] != "y" {
+		t.Errorf("input args were mutated: %#v", in)
+	}
+	nestedIn, _ := in["nested"].(map[string]any)
+	if nestedIn["token"] != "z" {
+		t.Errorf("nested input was mutated: %#v", in["nested"])
 	}
 }
 
