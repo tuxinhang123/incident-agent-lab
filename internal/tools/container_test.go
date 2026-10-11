@@ -58,6 +58,33 @@ func TestGetContainerStatusDockerMissing(t *testing.T) {
 	}
 }
 
+// When the context deadline expires, exec.CommandContext kills the child
+// process and Output returns *exec.ExitError; that must be reported as a
+// timeout rather than docker_unavailable.
+func TestGetContainerStatusTimeoutKilledReturnsTimeout(t *testing.T) {
+	run := func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, &exec.ExitError{Stderr: []byte("")}
+	}
+	_, err := getContainerStatus(ContainerStatusInput{Container: "slow"}, run)
+	if err == nil || err.Type != model.ErrorTypeTimeout {
+		t.Fatalf("want timeout, got %+v", err)
+	}
+}
+
+// A pre-cancelled context combined with an ExitError must also classify as
+// timeout, even when stderr happens to contain other text.
+func TestClassifyDockerErrorDeadlineExceededBeforeExitError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	<-ctx.Done()
+
+	_, err := classifyDockerError(ctx, &exec.ExitError{Stderr: []byte("signal: killed")}, nil)
+	if err == nil || err.Type != model.ErrorTypeTimeout {
+		t.Fatalf("want timeout, got %+v", err)
+	}
+}
+
 func stubRunner(out []byte, err error) commandRunner {
 	return func(_ context.Context, _ string, _ ...string) ([]byte, error) {
 		return out, err

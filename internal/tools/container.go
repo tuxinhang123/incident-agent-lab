@@ -61,7 +61,7 @@ func getContainerStatus(in ContainerStatusInput, run commandRunner) (*ContainerS
 
 	out, err := run(ctx, "docker", "inspect", "--format", "{{json .State}}", in.Container)
 	if err != nil {
-		return classifyDockerError(err, out)
+		return classifyDockerError(ctx, err, out)
 	}
 
 	var state dockerInspectState
@@ -82,7 +82,13 @@ func getContainerStatus(in ContainerStatusInput, run commandRunner) (*ContainerS
 	return res, nil
 }
 
-func classifyDockerError(err error, out []byte) (*ContainerStatusResult, *model.ToolError) {
+func classifyDockerError(ctx context.Context, err error, out []byte) (*ContainerStatusResult, *model.ToolError) {
+	// exec.CommandContext kills the child process when the context deadline
+	// expires, so Output returns *exec.ExitError rather than context.DeadlineExceeded.
+	// Check the context first to avoid misclassifying a timeout as docker_unavailable.
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, &model.ToolError{Type: model.ErrorTypeTimeout, Message: "docker inspect timed out"}
+	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		stderr := string(exitErr.Stderr)

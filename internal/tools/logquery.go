@@ -73,12 +73,12 @@ func queryServiceLogs(in ServiceLogsInput, run commandRunner) (*ServiceLogsResul
 
 	out, err := run(ctx, "docker", "logs", "--tail", strconv.Itoa(tail), in.Service)
 	if err != nil {
-		return nil, classifyLogsError(err)
+		return nil, classifyLogsError(ctx, err)
 	}
-	return aggregateLogs(in.Service, out), nil
+	return aggregateLogs(in.Service, out)
 }
 
-func aggregateLogs(service string, raw []byte) *ServiceLogsResult {
+func aggregateLogs(service string, raw []byte) (*ServiceLogsResult, *model.ToolError) {
 	res := &ServiceLogsResult{Service: service, MatchedErrors: []ErrorAggregate{}}
 	groups := map[string]*ErrorAggregate{}
 	var order []string
@@ -110,6 +110,12 @@ func aggregateLogs(service string, raw []byte) *ServiceLogsResult {
 			g.Sample = truncate(entry.Message, logsSampleMaxChars)
 		}
 	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		if errors.Is(scanErr, bufio.ErrTooLong) {
+			return nil, &model.ToolError{Type: model.ErrorTypeInternal, Message: "log line exceeds maximum length"}
+		}
+		return nil, &model.ToolError{Type: model.ErrorTypeInternal, Message: scanErr.Error()}
+	}
 
 	for _, key := range order {
 		if len(res.MatchedErrors) >= logsMaxErrorGroups {
@@ -117,7 +123,7 @@ func aggregateLogs(service string, raw []byte) *ServiceLogsResult {
 		}
 		res.MatchedErrors = append(res.MatchedErrors, *groups[key])
 	}
-	return res
+	return res, nil
 }
 
 // stripDockerTimestamp removes the "2006-01-02T15:04:05.000000000Z " prefix
@@ -134,7 +140,10 @@ func stripDockerTimestamp(line []byte) []byte {
 	return trimmed
 }
 
-func classifyLogsError(err error) *model.ToolError {
+func classifyLogsError(ctx context.Context, err error) *model.ToolError {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return &model.ToolError{Type: model.ErrorTypeTimeout, Message: "docker logs timed out"}
+	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		stderr := string(exitErr.Stderr)
@@ -145,9 +154,6 @@ func classifyLogsError(err error) *model.ToolError {
 	}
 	if errors.Is(err, exec.ErrNotFound) || strings.Contains(err.Error(), "no such file") {
 		return &model.ToolError{Type: model.ErrorTypeDockerUnavailable, Message: "docker CLI not found"}
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return &model.ToolError{Type: model.ErrorTypeTimeout, Message: "docker logs timed out"}
 	}
 	return &model.ToolError{Type: model.ErrorTypeDockerUnavailable, Message: err.Error()}
 }

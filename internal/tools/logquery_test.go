@@ -1,9 +1,11 @@
 package tools
 
 import (
+	"context"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tuxinhang123/incident-agent-lab/internal/model"
 )
@@ -17,7 +19,10 @@ func TestAggregateLogsGroupsByErrorType(t *testing.T) {
 		`not a json line`,
 	}, "\n"))
 
-	res := aggregateLogs("demo-api", raw)
+	res, err := aggregateLogs("demo-api", raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
 	if res.LinesScanned != 4 {
 		t.Fatalf("want 4 json lines scanned, got %d", res.LinesScanned)
 	}
@@ -31,9 +36,38 @@ func TestAggregateLogsGroupsByErrorType(t *testing.T) {
 }
 
 func TestAggregateLogsEmpty(t *testing.T) {
-	res := aggregateLogs("demo-api", nil)
+	res, err := aggregateLogs("demo-api", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
 	if res.LinesScanned != 0 || len(res.MatchedErrors) != 0 {
 		t.Fatalf("want empty result, got %+v", res)
+	}
+}
+
+func TestAggregateLogsTooLongLineReturnsInternalError(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"level":"error","message":"`)
+	b.WriteString(strings.Repeat("x", 1024*1024+10))
+	b.WriteString("\"}\n")
+	b.WriteString(`{"level":"error","service":"demo-api","operation":"redis_get","error_type":"timeout","message":"after the long line"}` + "\n")
+
+	res, err := aggregateLogs("demo-api", []byte(b.String()))
+	if err == nil || err.Type != model.ErrorTypeInternal {
+		t.Fatalf("want internal_error for overlong line, got res=%+v err=%+v", res, err)
+	}
+}
+
+func TestQueryServiceLogsTooLongLineReturnsInternalError(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"level":"error","message":"`)
+	b.WriteString(strings.Repeat("x", 1024*1024+10))
+	b.WriteString("\"}\n")
+	b.WriteString(`{"level":"error","error_type":"timeout","message":"after the long line"}` + "\n")
+
+	res, err := queryServiceLogs(ServiceLogsInput{Service: "ial-demo-api"}, stubRunner([]byte(b.String()), nil))
+	if err == nil || err.Type != model.ErrorTypeInternal {
+		t.Fatalf("want internal_error from queryServiceLogs, got res=%+v err=%+v", res, err)
 	}
 }
 
@@ -61,6 +95,27 @@ func TestQueryServiceLogsContainerMissing(t *testing.T) {
 	_, err := queryServiceLogs(ServiceLogsInput{Service: "ghost"}, stubRunner(nil, &exec.ExitError{Stderr: []byte("Error: No such container: ghost")}))
 	if err == nil || err.Type != model.ErrorTypeContainerMissing {
 		t.Fatalf("want container_not_found, got %+v", err)
+	}
+}
+
+func TestClassifyLogsErrorTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(time.Millisecond)
+	if got := ctx.Err(); got != context.DeadlineExceeded {
+		t.Fatalf("test setup: want expired ctx, got %v", got)
+	}
+
+	err := classifyLogsError(ctx, &exec.ExitError{Stderr: []byte("killed")})
+	if err == nil || err.Type != model.ErrorTypeTimeout {
+		t.Fatalf("want timeout when ctx deadline exceeded even with ExitError, got %+v", err)
+	}
+
+	aliveCtx, aliveCancel := context.WithTimeout(context.Background(), time.Second)
+	defer aliveCancel()
+	err = classifyLogsError(aliveCtx, &exec.ExitError{Stderr: []byte("daemon down")})
+	if err == nil || err.Type != model.ErrorTypeDockerUnavailable {
+		t.Fatalf("want docker_unavailable for ExitError without timeout, got %+v", err)
 	}
 }
 

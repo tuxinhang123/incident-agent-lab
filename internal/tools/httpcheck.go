@@ -57,7 +57,6 @@ func CheckHTTPEndpoint(in HTTPEndpointInput) (*HTTPEndpointResult, *model.ToolEr
 
 	start := time.Now()
 	resp, err := http.DefaultClient.Do(req)
-	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, &model.ToolError{Type: model.ErrorTypeTimeout, Message: "request timed out"}
@@ -66,7 +65,14 @@ func CheckHTTPEndpoint(in HTTPEndpointInput) (*HTTPEndpointResult, *model.ToolEr
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, httpMaxBodyBytes))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, httpMaxBodyBytes))
+	latency := time.Since(start).Milliseconds()
+	if readErr != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, &model.ToolError{Type: model.ErrorTypeTimeout, Message: "request timed out"}
+		}
+		return nil, &model.ToolError{Type: model.ErrorTypeConnectionFailed, Message: readErr.Error()}
+	}
 	return &HTTPEndpointResult{
 		StatusCode:  resp.StatusCode,
 		LatencyMS:   latency,

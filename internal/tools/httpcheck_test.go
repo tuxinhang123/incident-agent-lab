@@ -59,6 +59,23 @@ func TestCheckHTTPEndpointInvalidInput(t *testing.T) {
 	}
 }
 
+func TestCheckHTTPEndpointBodyReadTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	res, err := CheckHTTPEndpoint(HTTPEndpointInput{URL: srv.URL, TimeoutMS: 150})
+	if err == nil || err.Type != model.ErrorTypeTimeout {
+		t.Fatalf("want timeout, got res=%+v err=%+v", res, err)
+	}
+	if res != nil {
+		t.Fatalf("want nil result on body read timeout, got %+v", res)
+	}
+}
+
 func TestCheckHTTPEndpointConnectionFailed(t *testing.T) {
 	ln := mustListenClosed(t)
 	_, err := CheckHTTPEndpoint(HTTPEndpointInput{URL: "http://" + ln, TimeoutMS: 1000})
