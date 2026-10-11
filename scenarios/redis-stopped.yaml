@@ -1,0 +1,28 @@
+id: redis_stopped
+title: Redis 容器停止导致 demo-api 返回 5xx
+question: demo-api 接口持续返回 500，请定位原因
+
+inject:
+  docker: docker compose -f deploy/compose.yaml stop redis
+  local: "kill $(cat .run/redis.pid)"
+recover:
+  docker: docker compose -f deploy/compose.yaml start redis
+  local: bash -c 'redis-server --daemonize yes --port 6379 --dir .run --pidfile .run/redis.pid --save "" --appendonly no'
+
+expected:
+  healthy:
+    /health: 200
+    /ready: 200
+    /api/data: 200
+  fault:
+    /health: 200
+    /ready: 503
+    /api/data: 500
+    log:
+      operation: redis_get
+      error_type: connection_refused
+  recovered:
+    /ready: 200
+    /api/data: 200
+
+expected_root_cause: redis_not_running
