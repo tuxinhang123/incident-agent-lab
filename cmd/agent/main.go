@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,6 +44,8 @@ func main() {
 		err = runContainerStatus(os.Args[2:], runID, audit)
 	case "service-logs":
 		err = runServiceLogs(os.Args[2:], runID, audit)
+	case "diagnose":
+		err = runDiagnose(os.Args[2:], runID, audit)
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -113,6 +116,38 @@ func writeAudit(audit *agent.AuditLog, runID, tool string, args map[string]any, 
 	}
 }
 
+func runDiagnose(argv []string, runID string, audit *agent.AuditLog) error {
+	def := agent.DefaultTarget()
+	fs := flag.NewFlagSet("diagnose", flag.ContinueOnError)
+	baseURL := fs.String("base-url", def.BaseURL, "base URL of demo-api")
+	appContainer := fs.String("app-container", def.AppContainer, "demo-api container name")
+	redisContainer := fs.String("redis-container", def.RedisContainer, "redis container name")
+	timeoutMS := fs.Int("timeout-ms", def.HTTPTimeoutMS, "per-request timeout in milliseconds")
+	tail := fs.Int("tail", def.LogTailLines, "number of recent log lines")
+	if err := fs.Parse(argv); err != nil {
+		return errUsage
+	}
+
+	cfg := agent.TargetConfig{
+		BaseURL:        *baseURL,
+		AppContainer:   *appContainer,
+		RedisContainer: *redisContainer,
+		HTTPTimeoutMS:  *timeoutMS,
+		LogTailLines:   *tail,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	chat, mErr := agent.NewChatModel(ctx, agent.LoadModelConfig())
+	if mErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: model disabled: %v\n", mErr)
+	}
+
+	report := agent.Run(ctx, runID, cfg, chat, audit)
+	return agent.EncodeJSON(os.Stdout, report)
+}
+
 func emit(result any, toolErr *model.ToolError) error {
 	if toolErr != nil {
 		if err := agent.EncodeJSON(os.Stdout, map[string]any{
@@ -134,6 +169,12 @@ read-only diagnostic tools:
   check-http        -url <url> [-timeout-ms 3000]
   container-status  -container <name>
   service-logs      -service <name> [-tail 200]
+
+fixed-order diagnosis workflow:
+  diagnose [-base-url http://127.0.0.1:8080] [-app-container ial-demo-api]
+           [-redis-container ial-redis] [-timeout-ms 3000] [-tail 200]
+  (set OPENAI_API_KEY / OPENAI_BASE_URL / MODEL_NAME to enable the LLM;
+   without a key the built-in rule diagnoser is used)
 
 audit trail is appended to .run/tool-calls.jsonl
 `)

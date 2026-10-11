@@ -82,6 +82,36 @@ make build
 
 工具错误统一归类为：`timeout` / `connection_failed` / `container_not_found` / `docker_unavailable` / `invalid_input` / `internal_error`。所有工具都有超时（HTTP 默认 3s 上限 10s；docker 命令 5-8s）、输入校验与输出大小上限（body 摘要 200 字符、日志最多 20 个错误组）。
 
+## Agent 诊断工作流（Day 3，Eino）
+
+三个工具通过 [Eino](https://github.com/cloudwego/eino) `utils.InferTool` 注册为带 JSON Schema 的 InvokableTool，由固定顺序工作流调用：
+
+```
+HTTP 三接口 → 应用错误日志聚合 → Redis/应用容器状态 → 诊断 → 规则校验 → 结构化输出
+```
+
+诊断器分两层：
+- **规则诊断器（默认，无需模型）**：基于采集到的 HTTP 状态码、日志错误类型和容器状态做确定性判断，输出根因枚举，保证无 API Key 也能跑通闭环，也是评测基线。
+- **模型诊断器（可选）**：设置 `OPENAI_API_KEY`（兼容 `OPENAI_BASE_URL` / `MODEL_NAME`）后启用 Eino `openai.NewChatModel`，模型只产出根因、置信度和证据引用，其结论必须通过与规则诊断器同源的证据校验，无证据支持时回退规则结论——不开放自动修复。
+
+根因枚举：`redis_not_running` / `app_stopped` / `app_endpoint_timeout` / `no_incident` / `unknown`；无充分证据时返回 `insufficient_evidence`。
+
+```bash
+make build
+
+# 无 Docker daemon 的本地模式也能诊断（容器/日志工具失败成为观测，
+# 仅凭 /ready 503 + /api/data 500 信号即可判为 redis_not_running）
+./bin/agent diagnose
+./bin/agent diagnose --base-url http://localhost:8080 \
+  --app-container ial-demo-api --redis-container ial-redis
+
+# 启用模型
+OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://api.openai.com/v1 \
+  MODEL_NAME=gpt-4o-mini ./bin/agent diagnose
+```
+
+`diagnose` 始终输出 Report JSON（`diagnosis_source` 标记 `rules`/`model`），单工具失败不中断流程；每次工具调用都写入审计 JSONL。
+
 ## 无 Docker 环境的本地方式
 
 需要本机已安装 Go 和 redis-server：
@@ -100,10 +130,11 @@ make test
 
 ## 路线图
 
-- Day 1：仓库、Go 服务 + Redis + Compose，稳定复现"Redis 停止"故障
-- Day 2（当前）：三个只读诊断工具（容器状态、日志聚合、HTTP 检查）+ CLI 与调用审计
-- Day 3-4：接入 Eino，固定顺序诊断工作流与结构化输出
+- Day 1：Go 服务 + Redis + Compose，稳定复现"Redis 停止"故障
+- Day 2：三个只读诊断工具（容器状态、日志聚合、HTTP 检查）+ CLI 与调用审计
+- Day 3：接入 Eino——工具注册为 InvokableTool，固定顺序收集证据，ChatModel（OpenAI 兼容）+ 证据规则校验，无 Key 时确定性规则诊断（当前）
+- Day 4：固定顺序工作流与证据聚合、规则校验（已随 Day 3 落地）
 - Day 5：5 个离线评测 Case
-- Day 6-7：运行可观测性、文档与演示
+- Day 6-7：运行可观测性（Run ID/工具轨迹审计已有）、文档与演示
 
 详见 [docs/architecture.md](docs/architecture.md)。
