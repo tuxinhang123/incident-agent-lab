@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/tuxinhang/incident-agent-lab/internal/rediskv"
+	"github.com/tuxinhang123/incident-agent-lab/internal/rediskv"
 )
 
 const dataKey = "demo:greeting"
