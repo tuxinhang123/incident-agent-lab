@@ -137,3 +137,174 @@ func TestParseModelDiagnosis(t *testing.T) {
 		t.Fatal("non-JSON content must return nil")
 	}
 }
+
+func redisDownEvidenceFixture() *model.CollectedEvidence {
+	return &model.CollectedEvidence{
+		Health: &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Ready:  &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 503},
+		Data:   &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 500},
+		AppLogs: &model.LogObservation{Source: ToolServiceLogs, OK: true, Errors: []model.ErrorAggregate{
+			{ErrorType: "connection_refused", Count: 12, Sample: "failed to connect to redis"},
+		}},
+		RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Status: "exited", Running: false, ExitCode: intPtr(0)},
+	}
+}
+
+func TestValidateRejectsEmptyEvidence(t *testing.T) {
+	ev := redisDownEvidenceFixture()
+	modelSays := &model.Diagnosis{
+		Status: model.StatusDiagnosed, RootCause: model.CauseRedisNotRunning, Confidence: 0.9,
+	}
+	if _, ok := Validate(modelSays, ev); ok {
+		t.Fatal("model diagnosis without evidence must be rejected")
+	}
+}
+
+func TestValidateRejectsFabricatedFact(t *testing.T) {
+	ev := redisDownEvidenceFixture()
+	modelSays := &model.Diagnosis{
+		Status: model.StatusDiagnosed, RootCause: model.CauseRedisNotRunning, Confidence: 0.9,
+		Evidence: []model.EvidenceItem{{Source: ToolCheckHTTP, Fact: "/ready returned 200"}},
+	}
+	if _, ok := Validate(modelSays, ev); ok {
+		t.Fatal("fabricated status code fact must be rejected")
+	}
+}
+
+func TestValidateRejectsStatusMismatch(t *testing.T) {
+	ev := redisDownEvidenceFixture()
+	modelSays := &model.Diagnosis{
+		Status: model.StatusHealthy, RootCause: model.CauseRedisNotRunning, Confidence: 0.9,
+		Evidence: []model.EvidenceItem{{Source: ToolCheckHTTP, Fact: "/ready returned 503"}},
+	}
+	if _, ok := Validate(modelSays, ev); ok {
+		t.Fatal("status contradicting root cause must be rejected")
+	}
+}
+
+func TestValidateRejectsConfidenceOutOfRange(t *testing.T) {
+	ev := redisDownEvidenceFixture()
+	for _, conf := range []float64{1.5, -0.2} {
+		modelSays := &model.Diagnosis{
+			Status: model.StatusDiagnosed, RootCause: model.CauseRedisNotRunning, Confidence: conf,
+			Evidence: []model.EvidenceItem{{Source: ToolCheckHTTP, Fact: "/ready returned 503"}},
+		}
+		if _, ok := Validate(modelSays, ev); ok {
+			t.Fatalf("confidence %f out of [0,1] must be rejected", conf)
+		}
+	}
+}
+
+func TestValidateAcceptsValidModelConclusion(t *testing.T) {
+	ev := redisDownEvidenceFixture()
+	modelSays := &model.Diagnosis{
+		Status: model.StatusDiagnosed, RootCause: model.CauseRedisNotRunning, Confidence: 0.87,
+		Evidence: []model.EvidenceItem{
+			{Source: ToolCheckHTTP, Fact: "/ready returned 503 and /api/data returned 500"},
+			{Source: ToolServiceLogs, Fact: "logs show connection_refused errors"},
+			{Source: ToolContainerGet, Fact: "redis container is exited"},
+		},
+	}
+	got, ok := Validate(modelSays, ev)
+	if !ok || got.RootCause != model.CauseRedisNotRunning {
+		t.Fatalf("valid model conclusion should be accepted, got ok=%v %+v", ok, got)
+	}
+}
+
+func TestValidateAcceptsDescriptiveFact(t *testing.T) {
+	ev := redisDownEvidenceFixture()
+	modelSays := &model.Diagnosis{
+		Status: model.StatusDiagnosed, RootCause: model.CauseRedisNotRunning, Confidence: 0.5,
+		Evidence: []model.EvidenceItem{{Source: ToolCheckHTTP, Fact: "the readiness probe was failing"}},
+	}
+	if _, ok := Validate(modelSays, ev); !ok {
+		t.Fatal("non-empty descriptive fact without concrete signals should be accepted")
+	}
+}
+
+func TestValidateEmptyStatusFilledFromRootCause(t *testing.T) {
+	ev := redisDownEvidenceFixture()
+	modelSays := &model.Diagnosis{
+		RootCause: model.CauseRedisNotRunning, Confidence: 0.8,
+		Evidence: []model.EvidenceItem{{Source: ToolCheckHTTP, Fact: "/ready returned 503"}},
+	}
+	got, ok := Validate(modelSays, ev)
+	if !ok || got.Status != model.StatusDiagnosed {
+		t.Fatalf("empty status should be defaulted to diagnosed, got ok=%v %+v", ok, got)
+	}
+}
+
+func TestDiagnoseRulesHealthyIgnoresStaleLogs(t *testing.T) {
+	ev := &model.CollectedEvidence{
+		Health: &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Ready:  &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Data:   &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		AppLogs: &model.LogObservation{Source: ToolServiceLogs, OK: true, Errors: []model.ErrorAggregate{
+			{ErrorType: "connection_refused", Count: 3, Sample: "failed to connect to redis"},
+		}},
+		RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Status: "running", Running: true},
+	}
+	d := DiagnoseRules(ev)
+	if d.Status != model.StatusHealthy || d.RootCause != model.CauseNone {
+		t.Fatalf("want no_incident despite stale logs, got %s/%s", d.Status, d.RootCause)
+	}
+	for _, e := range d.Evidence {
+		if e.Source == ToolServiceLogs {
+			t.Fatalf("healthy conclusion must not cite stale log errors: %+v", d.Evidence)
+		}
+	}
+}
+
+func TestDiagnoseRulesRedisDownIncludesLogEvidenceWithCurrentSignals(t *testing.T) {
+	ev := &model.CollectedEvidence{
+		Health: &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Ready:  &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 503},
+		Data:   &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 500},
+		AppLogs: &model.LogObservation{Source: ToolServiceLogs, OK: true, Errors: []model.ErrorAggregate{
+			{ErrorType: "connection_refused", Count: 9, Sample: "failed to connect to redis"},
+		}},
+		RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: false, ErrorType: model.ErrorTypeDockerUnavailable},
+	}
+	d := DiagnoseRules(ev)
+	if d.RootCause != model.CauseRedisNotRunning {
+		t.Fatalf("want redis_not_running, got %s", d.RootCause)
+	}
+	foundLog := false
+	for _, e := range d.Evidence {
+		if e.Source == ToolServiceLogs {
+			foundLog = true
+		}
+	}
+	if !foundLog {
+		t.Fatalf("log evidence must accompany current 503/500 signals: %+v", d.Evidence)
+	}
+}
+
+func TestDiagnoseRulesStaleLogsAloneDoNotFlagRedisDown(t *testing.T) {
+	ev := &model.CollectedEvidence{
+		Health: &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Ready:  &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: false, ErrorType: model.ErrorTypeConnectionFailed},
+		Data:   &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: false, ErrorType: model.ErrorTypeConnectionFailed},
+		AppLogs: &model.LogObservation{Source: ToolServiceLogs, OK: true, Errors: []model.ErrorAggregate{
+			{ErrorType: "connection_refused", Count: 3, Sample: "failed to connect to redis"},
+		}},
+		RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Status: "running", Running: true},
+	}
+	d := DiagnoseRules(ev)
+	if d.RootCause == model.CauseRedisNotRunning {
+		t.Fatalf("stale connection_refused logs without a current signal must not flag redis down, got %+v", d)
+	}
+}
+
+func TestDiagnoseRulesHealthyButRedisExitedIsContradiction(t *testing.T) {
+	ev := &model.CollectedEvidence{
+		Health:      &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Ready:       &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Data:        &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Status: "exited", Running: false, ExitCode: intPtr(0)},
+	}
+	d := DiagnoseRules(ev)
+	if d.Status != model.StatusInsufficientEvidence || d.RootCause != model.CauseUnknown || d.Confidence != 0 {
+		t.Fatalf("want insufficient_evidence/unknown/0 for contradictory signals, got %s/%s/%f", d.Status, d.RootCause, d.Confidence)
+	}
+}

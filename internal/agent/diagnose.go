@@ -2,6 +2,9 @@ package agent
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/tuxinhang123/incident-agent-lab/internal/model"
 )
@@ -25,6 +28,25 @@ func DiagnoseRules(ev *model.CollectedEvidence) *model.Diagnosis {
 				"Inspect demo-api logs for startup errors",
 			},
 		}
+	case isHealthyRedisContradiction(ev):
+		return &model.Diagnosis{
+			Status:           model.StatusInsufficientEvidence,
+			RootCause:        model.CauseUnknown,
+			Confidence:       0,
+			Evidence:         collectedEvidenceItems(ev),
+			SuggestedActions: []string{"HTTP endpoints report healthy while the redis container is observed exited; re-collect evidence"},
+		}
+	case isHealthy(ev):
+		return &model.Diagnosis{
+			Status:     model.StatusHealthy,
+			RootCause:  model.CauseNone,
+			Confidence: 0.99,
+			Evidence: []model.EvidenceItem{
+				{Source: ToolCheckHTTP, Fact: fmt.Sprintf("/ready returned %d", codeOf(ev.Ready))},
+				{Source: ToolCheckHTTP, Fact: fmt.Sprintf("/api/data returned %d", codeOf(ev.Data))},
+			},
+			SuggestedActions: []string{},
+		}
 	case isEndpointTimeout(ev):
 		return &model.Diagnosis{
 			Status:     model.StatusDiagnosed,
@@ -46,17 +68,6 @@ func DiagnoseRules(ev *model.CollectedEvidence) *model.Diagnosis {
 				"Start the Redis container",
 				"Verify the readiness endpoint after recovery",
 			},
-		}
-	case isHealthy(ev):
-		return &model.Diagnosis{
-			Status:     model.StatusHealthy,
-			RootCause:  model.CauseNone,
-			Confidence: 0.99,
-			Evidence: []model.EvidenceItem{
-				{Source: ToolCheckHTTP, Fact: fmt.Sprintf("/ready returned %d", codeOf(ev.Ready))},
-				{Source: ToolCheckHTTP, Fact: fmt.Sprintf("/api/data returned %d", codeOf(ev.Data))},
-			},
-			SuggestedActions: []string{},
 		}
 	default:
 		return &model.Diagnosis{
@@ -85,17 +96,38 @@ func isEndpointTimeout(ev *model.CollectedEvidence) bool {
 }
 
 func isRedisDown(ev *model.CollectedEvidence) bool {
-	if ev.RedisStatus != nil && ev.RedisStatus.OK && !ev.RedisStatus.Running {
+	containerDown := ev.RedisStatus != nil && ev.RedisStatus.OK && !ev.RedisStatus.Running
+	if containerDown {
 		return true
 	}
-	if ev.AppLogs != nil && ev.AppLogs.OK && hasLogError(ev.AppLogs, "connection_refused") {
+	httpSignals := ev.Ready != nil && ev.Ready.OK && ev.Ready.StatusCode == 503 &&
+		ev.Data != nil && ev.Data.OK && ev.Data.StatusCode == 500
+	if httpSignals {
 		return true
 	}
-	if ev.Ready != nil && ev.Ready.OK && ev.Ready.StatusCode == 503 &&
-		ev.Data != nil && ev.Data.OK && ev.Data.StatusCode == 500 {
+	// Historical connection_refused log lines alone do not prove a current
+	// outage: they may linger in the log tail long after recovery. They
+	// only corroborate a currently failing signal.
+	if ev.AppLogs != nil && ev.AppLogs.OK && hasLogError(ev.AppLogs, "connection_refused") &&
+		(readyIs503(ev) || dataIs500(ev)) {
 		return true
 	}
 	return false
+}
+
+func readyIs503(ev *model.CollectedEvidence) bool {
+	return ev.Ready != nil && ev.Ready.OK && ev.Ready.StatusCode == 503
+}
+
+func dataIs500(ev *model.CollectedEvidence) bool {
+	return ev.Data != nil && ev.Data.OK && ev.Data.StatusCode == 500
+}
+
+// isHealthyRedisContradiction detects ready/data both 200 while the redis
+// container is explicitly observed exited: the signals disagree, so neither
+// healthy nor a fault is concluded.
+func isHealthyRedisContradiction(ev *model.CollectedEvidence) bool {
+	return isHealthy(ev) && ev.RedisStatus != nil && ev.RedisStatus.OK && !ev.RedisStatus.Running
 }
 
 func isHealthy(ev *model.CollectedEvidence) bool {
@@ -115,13 +147,16 @@ func hasLogError(o *model.LogObservation, errorType string) bool {
 
 func redisDownEvidence(ev *model.CollectedEvidence) []model.EvidenceItem {
 	var out []model.EvidenceItem
-	if ev.RedisStatus != nil && ev.RedisStatus.OK && !ev.RedisStatus.Running {
+	containerDown := ev.RedisStatus != nil && ev.RedisStatus.OK && !ev.RedisStatus.Running
+	if containerDown {
 		out = append(out, model.EvidenceItem{
 			Source: ToolContainerGet,
 			Fact:   "redis container status is " + containerFact(ev.RedisStatus),
 		})
 	}
-	if ev.AppLogs != nil && ev.AppLogs.OK {
+	// Logs only corroborate a currently observed anomaly; stale
+	// connection_refused lines from a recovered outage are not evidence.
+	if ev.AppLogs != nil && ev.AppLogs.OK && (containerDown || readyIs503(ev) || dataIs500(ev)) {
 		for _, e := range ev.AppLogs.Errors {
 			if e.Count > 0 {
 				out = append(out, model.EvidenceItem{
@@ -131,13 +166,13 @@ func redisDownEvidence(ev *model.CollectedEvidence) []model.EvidenceItem {
 			}
 		}
 	}
-	if ev.Ready != nil && ev.Ready.OK {
+	if readyIs503(ev) {
 		out = append(out, model.EvidenceItem{
 			Source: ToolCheckHTTP,
 			Fact:   fmt.Sprintf("/ready returned %d", ev.Ready.StatusCode),
 		})
 	}
-	if ev.Data != nil && ev.Data.OK {
+	if dataIs500(ev) {
 		out = append(out, model.EvidenceItem{
 			Source: ToolCheckHTTP,
 			Fact:   fmt.Sprintf("/api/data returned %d", ev.Data.StatusCode),
@@ -215,44 +250,199 @@ func codeOf(o *model.HTTPCheckObservation) int {
 }
 
 // Validate checks a model-produced diagnosis against the gathered evidence.
-// A root cause without supporting evidence is rejected and replaced by the
-// rule-based result so unsupported conclusions never reach the caller.
+// A model diagnosis is accepted only when its confidence, status, root
+// cause and every evidence item are consistent with the collected
+// observations; otherwise the rule-based result is returned so unsupported
+// or fabricated conclusions never reach the caller.
 func Validate(d *model.Diagnosis, ev *model.CollectedEvidence) (*model.Diagnosis, bool) {
 	if d == nil {
 		return DiagnoseRules(ev), false
 	}
-	switch d.RootCause {
-	case model.CauseRedisNotRunning:
-		if !isRedisDown(ev) {
-			return DiagnoseRules(ev), false
-		}
-		if len(d.Evidence) == 0 {
-			d.Evidence = redisDownEvidence(ev)
-		}
-	case model.CauseAppStopped:
-		if !isAppStopped(ev) {
-			return DiagnoseRules(ev), false
-		}
-	case model.CauseAppTimeout:
-		if !isEndpointTimeout(ev) {
-			return DiagnoseRules(ev), false
-		}
-	case model.CauseNone:
-		if !isHealthy(ev) {
-			return DiagnoseRules(ev), false
-		}
-		d.Status = model.StatusHealthy
-	default:
+	expectedStatus, supported := expectedModelStatus(d.RootCause, ev)
+	if !supported {
 		return DiagnoseRules(ev), false
 	}
-	if d.Status == "" {
-		d.Status = model.StatusDiagnosed
+	if d.Confidence < 0 || d.Confidence > 1 {
+		return DiagnoseRules(ev), false
 	}
-	if d.Evidence == nil {
-		d.Evidence = []model.EvidenceItem{}
+	if strings.TrimSpace(d.Status) == "" {
+		d.Status = expectedStatus
+	} else if d.Status != expectedStatus {
+		return DiagnoseRules(ev), false
+	}
+	if len(d.Evidence) == 0 {
+		return DiagnoseRules(ev), false
+	}
+	for _, item := range d.Evidence {
+		if !validEvidenceSource(item.Source) || strings.TrimSpace(item.Fact) == "" {
+			return DiagnoseRules(ev), false
+		}
+		if !verifyEvidenceItem(item, ev) {
+			return DiagnoseRules(ev), false
+		}
 	}
 	if d.SuggestedActions == nil {
 		d.SuggestedActions = []string{}
 	}
 	return d, true
+}
+
+// expectedModelStatus reports the status a model diagnosis must carry for
+// its root cause and whether the root cause predicate is supported by the
+// collected observations. An empty model status is filled with the returned
+// default by the caller; an explicitly wrong status is rejected.
+func expectedModelStatus(rootCause string, ev *model.CollectedEvidence) (string, bool) {
+	switch rootCause {
+	case model.CauseRedisNotRunning:
+		if !isRedisDown(ev) {
+			return "", false
+		}
+		return model.StatusDiagnosed, true
+	case model.CauseAppStopped:
+		if !isAppStopped(ev) {
+			return "", false
+		}
+		return model.StatusDiagnosed, true
+	case model.CauseAppTimeout:
+		if !isEndpointTimeout(ev) {
+			return "", false
+		}
+		return model.StatusDiagnosed, true
+	case model.CauseNone:
+		if !isHealthy(ev) {
+			return "", false
+		}
+		return model.StatusHealthy, true
+	case model.CauseUnknown:
+		return model.StatusInsufficientEvidence, true
+	default:
+		return "", false
+	}
+}
+
+func validEvidenceSource(source string) bool {
+	switch source {
+	case ToolCheckHTTP, ToolServiceLogs, ToolContainerGet:
+		return true
+	}
+	return false
+}
+
+var httpStatusCodeRe = regexp.MustCompile(`\b[1-5][0-9]{2}\b`)
+
+// verifyEvidenceItem reports whether one model-provided evidence fact is
+// directionally consistent with the collected observations. It uses simple
+// keyword matching rather than NLP: a non-empty descriptive fact without
+// extractable signals is accepted conservatively, while concrete claims
+// (status codes, timeouts, failures, container state) must match.
+func verifyEvidenceItem(item model.EvidenceItem, ev *model.CollectedEvidence) bool {
+	switch item.Source {
+	case ToolCheckHTTP:
+		return verifyHTTPEvidence(item.Fact, ev)
+	case ToolServiceLogs:
+		return verifyLogEvidence(item.Fact, ev)
+	case ToolContainerGet:
+		return verifyContainerEvidence(item.Fact, ev)
+	}
+	return false
+}
+
+func verifyHTTPEvidence(fact string, ev *model.CollectedEvidence) bool {
+	obs := map[string]*model.HTTPCheckObservation{
+		"/health": ev.Health, "/ready": ev.Ready, "/api/data": ev.Data,
+	}
+	// A code appearing right after a mentioned path binds to that path's
+	// observation, so "/ready returned 200" cannot pass when ready is 503
+	// even if 200 was seen on another endpoint.
+	for _, path := range []string{"/api/data", "/ready", "/health"} {
+		idx := strings.Index(fact, path)
+		if idx < 0 {
+			continue
+		}
+		tail := fact[idx+len(path):]
+		if loc := httpStatusCodeRe.FindStringIndex(tail); loc != nil && loc[0] <= 32 {
+			code, err := strconv.Atoi(tail[loc[0]:loc[1]])
+			if err != nil {
+				return false
+			}
+			o := obs[path]
+			if o == nil || !o.OK || o.StatusCode != code {
+				return false
+			}
+		}
+	}
+	if codeTexts := httpStatusCodeRe.FindAllString(fact, -1); len(codeTexts) > 0 {
+		// No bound path or the code precedes the path name: the code must
+		// have been observed on at least one HTTP endpoint.
+		for _, codeText := range codeTexts {
+			code, err := strconv.Atoi(codeText)
+			if err != nil {
+				return false
+			}
+			seen := false
+			for _, o := range obs {
+				if o != nil && o.OK && o.StatusCode == code {
+					seen = true
+				}
+			}
+			if !seen {
+				return false
+			}
+		}
+		return true
+	}
+	lower := strings.ToLower(fact)
+	if strings.Contains(lower, "timed out") || strings.Contains(lower, "timeout") {
+		for _, o := range obs {
+			if o != nil && !o.OK && o.ErrorType == model.ErrorTypeTimeout {
+				return true
+			}
+		}
+		return false
+	}
+	if strings.Contains(lower, "unreachable") || strings.Contains(lower, "connection") {
+		for _, o := range obs {
+			if o != nil && !o.OK {
+				return true
+			}
+		}
+		return false
+	}
+	// Non-empty descriptive fact without a concrete signal: accept.
+	return true
+}
+
+func verifyLogEvidence(fact string, ev *model.CollectedEvidence) bool {
+	if ev.AppLogs == nil || !ev.AppLogs.OK {
+		return false
+	}
+	lower := strings.ToLower(fact)
+	for _, errorType := range []string{"connection_refused", "timeout"} {
+		if strings.Contains(lower, errorType) && !hasLogError(ev.AppLogs, errorType) {
+			return false
+		}
+	}
+	return true
+}
+
+func verifyContainerEvidence(fact string, ev *model.CollectedEvidence) bool {
+	lower := strings.ToLower(fact)
+	claimedDown := strings.Contains(lower, "not running") ||
+		strings.Contains(lower, "exited") ||
+		strings.Contains(lower, "stopped")
+	mentionsRedis := strings.Contains(lower, "redis")
+	mentionsApp := strings.Contains(lower, "demo-api") || strings.Contains(lower, "app")
+	switch {
+	case mentionsRedis && claimedDown:
+		return ev.RedisStatus != nil && ev.RedisStatus.OK && !ev.RedisStatus.Running
+	case mentionsApp && claimedDown:
+		return ev.AppStatus != nil && ev.AppStatus.OK && !ev.AppStatus.Running
+	case mentionsRedis:
+		return ev.RedisStatus != nil && ev.RedisStatus.OK
+	case mentionsApp:
+		return ev.AppStatus != nil && ev.AppStatus.OK
+	default:
+		return (ev.RedisStatus != nil && ev.RedisStatus.OK) ||
+			(ev.AppStatus != nil && ev.AppStatus.OK)
+	}
 }
