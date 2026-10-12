@@ -468,6 +468,194 @@ func TestValidateContradictionAcceptsOnlyUnknown(t *testing.T) {
 	}
 }
 
+func TestVerifyContainerEvidenceHyphenatedCompounds(t *testing.T) {
+	cases := []struct {
+		name string
+		fact string
+	}{
+		{"not up-to-date", "redis image is not up-to-date"},
+		{"not running-config", "redis reported not running-config drift"},
+		{"down-time window", "redis is in a down-time window"},
+	}
+	obs := []struct {
+		name    string
+		running bool
+	}{
+		{"stopped", false},
+		{"running", true},
+	}
+	for _, tc := range cases {
+		for _, ob := range obs {
+			ev := &model.CollectedEvidence{
+				RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: ob.running},
+			}
+			if verifyContainerEvidence(tc.fact, ev) {
+				t.Fatalf("hyphenated compound %q must not be a state claim (redis observed %s)", tc.fact, ob.name)
+			}
+		}
+	}
+}
+
+func TestVerifyContainerEvidenceClauseBinding(t *testing.T) {
+	cases := []struct {
+		name         string
+		fact         string
+		redisRunning bool
+		appRunning   bool
+		redisOK      bool
+		appOK        bool
+		want         bool
+	}{
+		{
+			name:         "mixed clauses match observations redis running app stopped",
+			fact:         "redis is running; demo-api isnt healthy",
+			redisRunning: true,
+			appRunning:   false,
+			redisOK:      true,
+			appOK:        true,
+			want:         true,
+		},
+		{
+			name:         "mixed clauses contradict observations redis stopped app running",
+			fact:         "redis is running; demo-api isnt healthy",
+			redisRunning: false,
+			appRunning:   true,
+			redisOK:      true,
+			appOK:        true,
+			want:         false,
+		},
+		{
+			name:         "both running claims match observations",
+			fact:         "redis is running; demo-api is running",
+			redisRunning: true,
+			appRunning:   true,
+			redisOK:      true,
+			appOK:        true,
+			want:         true,
+		},
+		{
+			name:         "both running claims but redis stopped",
+			fact:         "redis is running; demo-api is running",
+			redisRunning: false,
+			appRunning:   true,
+			redisOK:      true,
+			appOK:        true,
+			want:         false,
+		},
+		{
+			name:         "both running claims but app stopped",
+			fact:         "redis is running; demo-api is running",
+			redisRunning: true,
+			appRunning:   false,
+			redisOK:      true,
+			appOK:        true,
+			want:         false,
+		},
+		{
+			name:         "single redis running claim running",
+			fact:         "redis is running",
+			redisRunning: true,
+			appRunning:   false,
+			redisOK:      true,
+			appOK:        true,
+			want:         true,
+		},
+		{
+			name:         "single redis running claim stopped",
+			fact:         "redis is running",
+			redisRunning: false,
+			appRunning:   true,
+			redisOK:      true,
+			appOK:        true,
+			want:         false,
+		},
+		{
+			name:         "single app negated claim stopped",
+			fact:         "demo-api is not running",
+			redisRunning: true,
+			appRunning:   false,
+			redisOK:      true,
+			appOK:        true,
+			want:         true,
+		},
+		{
+			name:         "single app negated claim running",
+			fact:         "demo-api is not running",
+			redisRunning: false,
+			appRunning:   true,
+			redisOK:      true,
+			appOK:        true,
+			want:         false,
+		},
+		{
+			name:         "coordinated plural claim both running",
+			fact:         "redis and demo-api are running",
+			redisRunning: true,
+			appRunning:   true,
+			redisOK:      true,
+			appOK:        true,
+			want:         true,
+		},
+		{
+			name:         "coordinated plural claim one stopped",
+			fact:         "redis and demo-api are running",
+			redisRunning: true,
+			appRunning:   false,
+			redisOK:      true,
+			appOK:        true,
+			want:         false,
+		},
+		{
+			name:         "unclear ownership rejected",
+			fact:         "redis is running with demo-api",
+			redisRunning: true,
+			appRunning:   true,
+			redisOK:      true,
+			appOK:        true,
+			want:         false,
+		},
+		{
+			name:         "app observation missing tool failure",
+			fact:         "redis is running; demo-api is running",
+			redisRunning: true,
+			appRunning:   false,
+			redisOK:      true,
+			appOK:        false,
+			want:         false,
+		},
+		{
+			name:         "newline separated clauses both match",
+			fact:         "redis is running\ndemo-api is stopped",
+			redisRunning: true,
+			appRunning:   false,
+			redisOK:      true,
+			appOK:        true,
+			want:         true,
+		},
+		{
+			name:         "period separated clauses both match",
+			fact:         "redis is running. demo-api is exited.",
+			redisRunning: true,
+			appRunning:   false,
+			redisOK:      true,
+			appOK:        true,
+			want:         true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &model.CollectedEvidence{
+				RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: tc.redisOK, Running: tc.redisRunning},
+				AppStatus:   &model.ContainerObservation{Source: ToolContainerGet, OK: tc.appOK, Running: tc.appRunning},
+			}
+			if got := verifyContainerEvidence(tc.fact, ev); got != tc.want {
+				t.Fatalf("verifyContainerEvidence(%q) = %v, want %v (redis running=%v, app running=%v)",
+					tc.fact, got, tc.want, tc.redisRunning, tc.appRunning)
+			}
+		})
+	}
+}
+
 func TestValidateFaultEvidenceRejectsUnknownAcceptsRedisDown(t *testing.T) {
 	ev := &model.CollectedEvidence{
 		Ready: &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 503},

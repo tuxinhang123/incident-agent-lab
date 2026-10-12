@@ -417,57 +417,163 @@ func verifyLogEvidence(fact string, ev *model.CollectedEvidence) bool {
 }
 
 var (
+	// A state word must be terminated by end of text, whitespace or explicit
+	// punctuation: Go's RE2 treats the letter/hyphen boundary in
+	// "up-to-date" or "down-time" as \b, so a trailing \b alone would read
+	// "not up-to-date" as the stopped-state claim "not up". RE2 has no
+	// lookahead, hence the explicit terminator class.
+	containerStateTerminator = `(?:[\s.,;:)!?'"\]}]|$)`
 	// containerNegatedClaimRe matches negated state phrases such as
-	// "not running", "isn't running" and "is not up" so they are
-	// classified as stopped-state claims rather than positive claims.
-	// Curly apostrophes are normalized to ASCII before matching.
-	containerNegatedClaimRe = regexp.MustCompile(`(?:\bnot\b|n't)\s+(?:running|up|healthy|alive)\b`)
+	// "not running", "isn't running", "isnt healthy" and "is not up" so
+	// they are classified as stopped-state claims rather than positive
+	// claims. Curly apostrophes are normalized to ASCII before matching.
+	containerNegatedClaimRe = regexp.MustCompile(`(?:\bnot\b|n't|\bisnt\b)\s+(?:running|up|healthy|alive)` + containerStateTerminator)
 	// containerDownClaimRe matches explicit stopped-state phrases ("down"
-	// with word boundaries, or a running=false style boolean claim).
-	containerDownClaimRe = regexp.MustCompile(`(?:\bdown\b|running\s*[:=]\s*false)`)
+	// terminated by the same punctuation rule, or a running=false style
+	// boolean claim).
+	containerDownClaimRe = regexp.MustCompile(`(?:\bdown` + containerStateTerminator + `|running\s*[:=]\s*false)`)
 	// containerUpClaimRe matches explicit running-state phrases. It is only
 	// consulted after down-claim matching, so negated phrases ("not
 	// running", "isn't up") can never be misread as running claims.
-	containerUpClaimRe = regexp.MustCompile(`(?:\b(?:running|up|healthy|alive)\b|running\s*[:=]\s*true)`)
+	containerUpClaimRe = regexp.MustCompile(`(?:\b(?:running|up|healthy|alive)` + containerStateTerminator + `|running\s*[:=]\s*true)`)
+	// containerClauseSplitRe splits a fact into clauses on semicolons,
+	// Chinese/ASCII sentence terminators, newlines or a ". " boundary, so
+	// each state claim can be bound to the container named in its own
+	// clause (note: "-" is intentionally not a separator because the
+	// container name "demo-api" contains one).
+	containerClauseSplitRe = regexp.MustCompile(`[;；。！？!?\r\n]+|\.\s+`)
 )
 
+// containerStateUp / containerStateDown are the two claim directions parsed
+// from a single clause.
+const (
+	containerStateUp   = "up"
+	containerStateDown = "down"
+)
+
+// verifyContainerEvidence reports whether the model-provided container fact is
+// directionally consistent with the collected observations. The fact is split
+// into clauses first: a negated state about demo-api in the second clause must
+// bind to the demo-api observation rather than being verified against redis
+// merely because "redis" appears earlier in the same fact. Every clause that
+// names a container must also carry one unambiguous state claim bound to that
+// container, and every such claim must agree with the corresponding (present,
+// successful) observation.
 func verifyContainerEvidence(fact string, ev *model.CollectedEvidence) bool {
 	lower := strings.ToLower(fact)
 	// Normalize the Unicode right single quotation mark so contractions
 	// such as "isn’t running" match the same negation rules as the
 	// ASCII-apostrophe form.
 	lower = strings.ReplaceAll(lower, "\u2019", "'")
-	// Stopped-state phrases take priority: negated forms ("not running",
-	// "isn't up", "not healthy", "not alive") and explicit stopped words
-	// must classify as down claims rather than running claims.
-	claimedDown := containerNegatedClaimRe.MatchString(lower) ||
-		strings.Contains(lower, "exited") ||
-		strings.Contains(lower, "stopped") ||
-		containerDownClaimRe.MatchString(lower)
-	claimedUp := !claimedDown && containerUpClaimRe.MatchString(lower)
-	// Facts without any recognizable explicit container state are rejected
-	// instead of accepted on mere observation presence.
-	if !claimedDown && !claimedUp {
+	boundClaims := 0
+	for _, clause := range containerClauseSplitRe.Split(lower, -1) {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		mentionsRedis := strings.Contains(clause, "redis")
+		mentionsApp := strings.Contains(clause, "demo-api") || strings.Contains(clause, "app")
+		if !mentionsRedis && !mentionsApp {
+			// A clause without a named container makes no verifiable claim.
+			continue
+		}
+		state, stateIdx, hasState := classifyContainerClauseState(clause)
+		if !hasState {
+			// A named container without a valid state word is not evidence.
+			return false
+		}
+		targets := make([]string, 0, 2)
+		if mentionsRedis && mentionsApp {
+			// One clause naming both containers is accepted only as a
+			// coordinated plural claim ("redis and demo-api are running");
+			// shapes like "redis is running with demo-api" leave one
+			// container without a determinable state.
+			if !coordinatedBothContainerClaim(clause, stateIdx) {
+				return false
+			}
+			targets = append(targets, "redis", "app")
+		} else if mentionsRedis {
+			targets = append(targets, "redis")
+		} else {
+			targets = append(targets, "app")
+		}
+		for _, target := range targets {
+			obs := containerObservationFor(target, ev)
+			// A missing observation or a failed tool call supports no claim.
+			if obs == nil || !obs.OK {
+				return false
+			}
+			running := obs.Running
+			if (state == containerStateUp) != running {
+				return false
+			}
+		}
+		boundClaims++
+	}
+	// At least one bound (container + state) clause is required.
+	return boundClaims > 0
+}
+
+func containerObservationFor(target string, ev *model.CollectedEvidence) *model.ContainerObservation {
+	if target == "redis" {
+		return ev.RedisStatus
+	}
+	return ev.AppStatus
+}
+
+// classifyContainerClauseState parses the single explicit state claim of one
+// clause, returning its direction and the byte offset of the matched phrase.
+// Stopped-state phrases take priority: negated forms ("not running", "isn't
+// up", "not healthy", "not alive"), explicit stopped words and down/boolean
+// phrases classify as down before positive words are consulted. Hyphenated
+// compounds such as "up-to-date" do not terminate the state word and so are
+// not state claims.
+func classifyContainerClauseState(clause string) (string, int, bool) {
+	if loc := containerNegatedClaimRe.FindStringIndex(clause); loc != nil {
+		return containerStateDown, loc[0], true
+	}
+	if idx := strings.Index(clause, "exited"); idx >= 0 {
+		return containerStateDown, idx, true
+	}
+	if idx := strings.Index(clause, "stopped"); idx >= 0 {
+		return containerStateDown, idx, true
+	}
+	if loc := containerDownClaimRe.FindStringIndex(clause); loc != nil {
+		return containerStateDown, loc[0], true
+	}
+	if loc := containerUpClaimRe.FindStringIndex(clause); loc != nil {
+		return containerStateUp, loc[0], true
+	}
+	return "", 0, false
+}
+
+// coordinatedBothContainerClaim reports whether a clause naming both
+// containers attaches one shared state to both via a coordinated plural
+// construction such as "redis and demo-api are running" (also "和/与/、").
+// Both container names must occur before the state phrase, joined by a
+// coordinating conjunction and followed by the plural verb "are".
+func coordinatedBothContainerClaim(clause string, stateIdx int) bool {
+	redisIdx := strings.Index(clause, "redis")
+	appIdx := strings.Index(clause, "demo-api")
+	if appIdx < 0 {
+		appIdx = strings.Index(clause, "app")
+	}
+	if redisIdx < 0 || appIdx < 0 || stateIdx < 0 {
 		return false
 	}
-	mentionsRedis := strings.Contains(lower, "redis")
-	mentionsApp := strings.Contains(lower, "demo-api") || strings.Contains(lower, "app")
-	var obs *model.ContainerObservation
-	switch {
-	case mentionsRedis:
-		obs = ev.RedisStatus
-	case mentionsApp:
-		obs = ev.AppStatus
-	default:
-		// No specific container (redis/app) identified: reject.
+	first, second := redisIdx, appIdx
+	if first > second {
+		first, second = second, first
+	}
+	if stateIdx <= second {
 		return false
 	}
-	// A missing observation or a failed tool call supports no claim.
-	if obs == nil || !obs.OK {
-		return false
+	betweenNames := clause[first:second]
+	for _, conj := range []string{"and", "和", "与", "、"} {
+		if strings.Contains(betweenNames, conj) {
+			beforeState := clause[second:stateIdx]
+			return strings.Contains(beforeState, "are")
+		}
 	}
-	if claimedDown {
-		return !obs.Running
-	}
-	return obs.Running
+	return false
 }
