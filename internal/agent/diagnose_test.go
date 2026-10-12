@@ -339,6 +339,59 @@ func TestVerifyContainerEvidenceRunningClaims(t *testing.T) {
 	}
 }
 
+func TestVerifyContainerEvidenceNegatedStateClaims(t *testing.T) {
+	negatedFacts := []string{
+		"redis container isn't running",
+		"redis container isn\u2019t running",
+		"redis container is not running",
+		"redis container not running",
+		"redis containers aren't running",
+		"redis container is not up",
+		"redis container isn't up",
+		"redis is not healthy",
+		"redis isn't healthy",
+		"redis not alive",
+		"redis isn't alive",
+	}
+	for _, fact := range negatedFacts {
+		// Observed running: a down claim must be rejected.
+		runningEv := &model.CollectedEvidence{
+			RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: true},
+		}
+		if verifyContainerEvidence(fact, runningEv) {
+			t.Fatalf("negated claim %q must be rejected when redis is observed running", fact)
+		}
+		// Observed stopped: a down claim must be accepted.
+		stoppedEv := &model.CollectedEvidence{
+			RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: false},
+		}
+		if !verifyContainerEvidence(fact, stoppedEv) {
+			t.Fatalf("negated claim %q must be accepted when redis is observed stopped", fact)
+		}
+	}
+
+	positiveFacts := []string{
+		"redis container is running",
+		"demo-api container is up",
+	}
+	for _, fact := range positiveFacts {
+		runningEv := &model.CollectedEvidence{
+			RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: true},
+			AppStatus:   &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: true},
+		}
+		if !verifyContainerEvidence(fact, runningEv) {
+			t.Fatalf("positive claim %q must be accepted when observed running", fact)
+		}
+		stoppedEv := &model.CollectedEvidence{
+			RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: false},
+			AppStatus:   &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: false},
+		}
+		if verifyContainerEvidence(fact, stoppedEv) {
+			t.Fatalf("positive claim %q must be rejected when observed stopped", fact)
+		}
+	}
+}
+
 func TestVerifyContainerEvidenceToolFailureRejectsAllClaims(t *testing.T) {
 	ev := &model.CollectedEvidence{
 		RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: false, ErrorType: model.ErrorTypeDockerUnavailable},

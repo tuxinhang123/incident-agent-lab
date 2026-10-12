@@ -417,20 +417,30 @@ func verifyLogEvidence(fact string, ev *model.CollectedEvidence) bool {
 }
 
 var (
+	// containerNegatedClaimRe matches negated state phrases such as
+	// "not running", "isn't running" and "is not up" so they are
+	// classified as stopped-state claims rather than positive claims.
+	// Curly apostrophes are normalized to ASCII before matching.
+	containerNegatedClaimRe = regexp.MustCompile(`(?:\bnot\b|n't)\s+(?:running|up|healthy|alive)\b`)
 	// containerDownClaimRe matches explicit stopped-state phrases ("down"
 	// with word boundaries, or a running=false style boolean claim).
 	containerDownClaimRe = regexp.MustCompile(`(?:\bdown\b|running\s*[:=]\s*false)`)
 	// containerUpClaimRe matches explicit running-state phrases. It is only
-	// consulted after down-claim matching, so "not running" can never be
-	// misread as a running claim.
+	// consulted after down-claim matching, so negated phrases ("not
+	// running", "isn't up") can never be misread as running claims.
 	containerUpClaimRe = regexp.MustCompile(`(?:\b(?:running|up|healthy|alive)\b|running\s*[:=]\s*true)`)
 )
 
 func verifyContainerEvidence(fact string, ev *model.CollectedEvidence) bool {
 	lower := strings.ToLower(fact)
-	// Stopped-state phrases take priority: "not running" must classify as a
-	// down claim rather than a running claim.
-	claimedDown := strings.Contains(lower, "not running") ||
+	// Normalize the Unicode right single quotation mark so contractions
+	// such as "isn’t running" match the same negation rules as the
+	// ASCII-apostrophe form.
+	lower = strings.ReplaceAll(lower, "\u2019", "'")
+	// Stopped-state phrases take priority: negated forms ("not running",
+	// "isn't up", "not healthy", "not alive") and explicit stopped words
+	// must classify as down claims rather than running claims.
+	claimedDown := containerNegatedClaimRe.MatchString(lower) ||
 		strings.Contains(lower, "exited") ||
 		strings.Contains(lower, "stopped") ||
 		containerDownClaimRe.MatchString(lower)
