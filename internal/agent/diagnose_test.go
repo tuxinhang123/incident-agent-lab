@@ -308,3 +308,130 @@ func TestDiagnoseRulesHealthyButRedisExitedIsContradiction(t *testing.T) {
 		t.Fatalf("want insufficient_evidence/unknown/0 for contradictory signals, got %s/%s/%f", d.Status, d.RootCause, d.Confidence)
 	}
 }
+
+func TestVerifyContainerEvidenceRunningClaims(t *testing.T) {
+	cases := []struct {
+		name    string
+		fact    string
+		running bool
+		ok      bool
+		want    bool
+	}{
+		{"redis running claim but stopped", "redis container is running", false, true, false},
+		{"redis running claim and running", "redis container is running", true, true, true},
+		{"app up claim but stopped", "demo-api container is up", false, true, false},
+		{"app up claim and running", "demo-api container is up", true, true, true},
+		{"redis down claim but running", "redis container not running", true, true, false},
+		{"redis down claim and stopped", "redis container not running", false, true, true},
+		{"no state word rejected when running", "container inspected", true, true, false},
+		{"no state word rejected when stopped", "container inspected", false, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &model.CollectedEvidence{
+				RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: tc.ok, Running: tc.running},
+				AppStatus:   &model.ContainerObservation{Source: ToolContainerGet, OK: tc.ok, Running: tc.running},
+			}
+			if got := verifyContainerEvidence(tc.fact, ev); got != tc.want {
+				t.Fatalf("verifyContainerEvidence(%q) = %v, want %v", tc.fact, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestVerifyContainerEvidenceToolFailureRejectsAllClaims(t *testing.T) {
+	ev := &model.CollectedEvidence{
+		RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: false, ErrorType: model.ErrorTypeDockerUnavailable},
+		AppStatus:   &model.ContainerObservation{Source: ToolContainerGet, OK: false, ErrorType: model.ErrorTypeDockerUnavailable},
+	}
+	for _, fact := range []string{
+		"redis container is running",
+		"redis container not running",
+		"demo-api container is up",
+		"demo-api container exited",
+	} {
+		if verifyContainerEvidence(fact, ev) {
+			t.Fatalf("claim %q must be rejected when the container tool failed", fact)
+		}
+	}
+}
+
+func TestValidateRejectsUnknownWhenRulesSayHealthy(t *testing.T) {
+	ev := &model.CollectedEvidence{
+		Ready: &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Data:  &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+	}
+	modelSays := &model.Diagnosis{
+		Status: model.StatusInsufficientEvidence, RootCause: model.CauseUnknown, Confidence: 0.3,
+		Evidence: []model.EvidenceItem{{Source: ToolCheckHTTP, Fact: "/ready returned 200"}},
+	}
+	got, ok := Validate(modelSays, ev)
+	if ok {
+		t.Fatal("unknown must be rejected on healthy evidence even with verifiable facts")
+	}
+	if got.RootCause != model.CauseNone {
+		t.Fatalf("rejected diagnosis must fall back to no_incident, got %s", got.RootCause)
+	}
+}
+
+func contradictoryEvidenceFixture() *model.CollectedEvidence {
+	return &model.CollectedEvidence{
+		Health:      &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Ready:       &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		Data:        &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 200},
+		RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Status: "exited", Running: false, ExitCode: intPtr(0)},
+	}
+}
+
+func TestValidateContradictionAcceptsOnlyUnknown(t *testing.T) {
+	verifiableUnknownEvidence := []model.EvidenceItem{
+		{Source: ToolCheckHTTP, Fact: "/ready returned 200 and /api/data returned 200"},
+		{Source: ToolContainerGet, Fact: "redis container running=false"},
+	}
+
+	noIncident := &model.Diagnosis{
+		Status: model.StatusHealthy, RootCause: model.CauseNone, Confidence: 0.8,
+		Evidence: verifiableUnknownEvidence,
+	}
+	if got, ok := Validate(noIncident, contradictoryEvidenceFixture()); ok {
+		t.Fatalf("no_incident must be rejected on contradictory evidence, got %+v", got)
+	}
+
+	redisDown := &model.Diagnosis{
+		Status: model.StatusDiagnosed, RootCause: model.CauseRedisNotRunning, Confidence: 0.8,
+		Evidence: verifiableUnknownEvidence,
+	}
+	if got, ok := Validate(redisDown, contradictoryEvidenceFixture()); ok {
+		t.Fatalf("redis_not_running must be rejected on contradictory evidence, got %+v", got)
+	}
+
+	unknown := &model.Diagnosis{
+		Status: model.StatusInsufficientEvidence, RootCause: model.CauseUnknown, Confidence: 0,
+		Evidence: verifiableUnknownEvidence,
+	}
+	got, ok := Validate(unknown, contradictoryEvidenceFixture())
+	if !ok || got.RootCause != model.CauseUnknown || got.Status != model.StatusInsufficientEvidence {
+		t.Fatalf("unknown/insufficient_evidence with verifiable facts must be accepted, got ok=%v %+v", ok, got)
+	}
+}
+
+func TestValidateFaultEvidenceRejectsUnknownAcceptsRedisDown(t *testing.T) {
+	ev := &model.CollectedEvidence{
+		Ready: &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 503},
+		Data:  &model.HTTPCheckObservation{Source: ToolCheckHTTP, OK: true, StatusCode: 500},
+	}
+	unknown := &model.Diagnosis{
+		Status: model.StatusInsufficientEvidence, RootCause: model.CauseUnknown, Confidence: 0.2,
+		Evidence: []model.EvidenceItem{{Source: ToolCheckHTTP, Fact: "/ready returned 503"}},
+	}
+	if _, ok := Validate(unknown, ev); ok {
+		t.Fatal("unknown must be rejected when rules diagnose a concrete fault")
+	}
+	redisDown := &model.Diagnosis{
+		Status: model.StatusDiagnosed, RootCause: model.CauseRedisNotRunning, Confidence: 0.9,
+		Evidence: []model.EvidenceItem{{Source: ToolCheckHTTP, Fact: "/ready returned 503 and /api/data returned 500"}},
+	}
+	if got, ok := Validate(redisDown, ev); !ok || got.RootCause != model.CauseRedisNotRunning {
+		t.Fatalf("redis_not_running must stay accepted on fault evidence, got ok=%v %+v", ok, got)
+	}
+}

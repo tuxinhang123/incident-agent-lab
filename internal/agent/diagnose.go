@@ -288,30 +288,21 @@ func Validate(d *model.Diagnosis, ev *model.CollectedEvidence) (*model.Diagnosis
 }
 
 // expectedModelStatus reports the status a model diagnosis must carry for
-// its root cause and whether the root cause predicate is supported by the
-// collected observations. An empty model status is filled with the returned
-// default by the caller; an explicitly wrong status is rejected.
+// its root cause and whether that root cause is the unique conclusion the
+// rule-based diagnoser reaches for the same evidence. Mutually exclusive
+// model conclusions (e.g. no_incident vs redis_not_running for a
+// contradictory evidence set) cannot all pass: the model root cause must
+// equal the rule baseline. An empty model status is filled with the
+// returned default by the caller; an explicitly wrong status is rejected.
 func expectedModelStatus(rootCause string, ev *model.CollectedEvidence) (string, bool) {
-	switch rootCause {
-	case model.CauseRedisNotRunning:
-		if !isRedisDown(ev) {
-			return "", false
-		}
-		return model.StatusDiagnosed, true
-	case model.CauseAppStopped:
-		if !isAppStopped(ev) {
-			return "", false
-		}
-		return model.StatusDiagnosed, true
-	case model.CauseAppTimeout:
-		if !isEndpointTimeout(ev) {
-			return "", false
-		}
+	ruleD := DiagnoseRules(ev)
+	if rootCause != ruleD.RootCause {
+		return "", false
+	}
+	switch ruleD.RootCause {
+	case model.CauseRedisNotRunning, model.CauseAppStopped, model.CauseAppTimeout:
 		return model.StatusDiagnosed, true
 	case model.CauseNone:
-		if !isHealthy(ev) {
-			return "", false
-		}
 		return model.StatusHealthy, true
 	case model.CauseUnknown:
 		return model.StatusInsufficientEvidence, true
@@ -425,24 +416,48 @@ func verifyLogEvidence(fact string, ev *model.CollectedEvidence) bool {
 	return true
 }
 
+var (
+	// containerDownClaimRe matches explicit stopped-state phrases ("down"
+	// with word boundaries, or a running=false style boolean claim).
+	containerDownClaimRe = regexp.MustCompile(`(?:\bdown\b|running\s*[:=]\s*false)`)
+	// containerUpClaimRe matches explicit running-state phrases. It is only
+	// consulted after down-claim matching, so "not running" can never be
+	// misread as a running claim.
+	containerUpClaimRe = regexp.MustCompile(`(?:\b(?:running|up|healthy|alive)\b|running\s*[:=]\s*true)`)
+)
+
 func verifyContainerEvidence(fact string, ev *model.CollectedEvidence) bool {
 	lower := strings.ToLower(fact)
+	// Stopped-state phrases take priority: "not running" must classify as a
+	// down claim rather than a running claim.
 	claimedDown := strings.Contains(lower, "not running") ||
 		strings.Contains(lower, "exited") ||
-		strings.Contains(lower, "stopped")
+		strings.Contains(lower, "stopped") ||
+		containerDownClaimRe.MatchString(lower)
+	claimedUp := !claimedDown && containerUpClaimRe.MatchString(lower)
+	// Facts without any recognizable explicit container state are rejected
+	// instead of accepted on mere observation presence.
+	if !claimedDown && !claimedUp {
+		return false
+	}
 	mentionsRedis := strings.Contains(lower, "redis")
 	mentionsApp := strings.Contains(lower, "demo-api") || strings.Contains(lower, "app")
+	var obs *model.ContainerObservation
 	switch {
-	case mentionsRedis && claimedDown:
-		return ev.RedisStatus != nil && ev.RedisStatus.OK && !ev.RedisStatus.Running
-	case mentionsApp && claimedDown:
-		return ev.AppStatus != nil && ev.AppStatus.OK && !ev.AppStatus.Running
 	case mentionsRedis:
-		return ev.RedisStatus != nil && ev.RedisStatus.OK
+		obs = ev.RedisStatus
 	case mentionsApp:
-		return ev.AppStatus != nil && ev.AppStatus.OK
+		obs = ev.AppStatus
 	default:
-		return (ev.RedisStatus != nil && ev.RedisStatus.OK) ||
-			(ev.AppStatus != nil && ev.AppStatus.OK)
+		// No specific container (redis/app) identified: reject.
+		return false
 	}
+	// A missing observation or a failed tool call supports no claim.
+	if obs == nil || !obs.OK {
+		return false
+	}
+	if claimedDown {
+		return !obs.Running
+	}
+	return obs.Running
 }
