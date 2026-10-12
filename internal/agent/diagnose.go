@@ -436,6 +436,17 @@ var (
 	// consulted after down-claim matching, so negated phrases ("not
 	// running", "isn't up") can never be misread as running claims.
 	containerUpClaimRe = regexp.MustCompile(`(?:\b(?:running|up|healthy|alive)` + containerStateTerminator + `|running\s*[:=]\s*true)`)
+	// containerStoppedWordRe matches the explicit stopped-state words
+	// "exited"/"stopped" as literal spans (same semantics as the historical
+	// strings.Index lookups) so they can be masked together with the other
+	// down claims.
+	containerStoppedWordRe = regexp.MustCompile(`(?:exited|stopped)`)
+	// redisSelfReferenceRe / appSelfReferenceRe match a clause's explicit
+	// container self-references. Word boundaries keep ordinary English words
+	// that merely contain the substring "app" (appears, apparently, apply,
+	// happened, snapp...) from binding a claim to the application container.
+	redisSelfReferenceRe = regexp.MustCompile(`\bredis\b`)
+	appSelfReferenceRe   = regexp.MustCompile(`(?:\bapp\b|demo-api|demo api|\bapplication\b)`)
 	// containerClauseSplitRe splits a fact into clauses on semicolons,
 	// Chinese/ASCII sentence terminators, newlines or a ". " boundary, so
 	// each state claim can be bound to the container named in its own
@@ -471,8 +482,8 @@ func verifyContainerEvidence(fact string, ev *model.CollectedEvidence) bool {
 		if clause == "" {
 			continue
 		}
-		mentionsRedis := strings.Contains(clause, "redis")
-		mentionsApp := strings.Contains(clause, "demo-api") || strings.Contains(clause, "app")
+		mentionsRedis := redisReferenceIndex(clause) >= 0
+		mentionsApp := appReferenceIndex(clause) >= 0
 		if !mentionsRedis && !mentionsApp {
 			// A clause without a named container makes no verifiable claim.
 			continue
@@ -521,30 +532,108 @@ func containerObservationFor(target string, ev *model.CollectedEvidence) *model.
 	return ev.AppStatus
 }
 
-// classifyContainerClauseState parses the single explicit state claim of one
-// clause, returning its direction and the byte offset of the matched phrase.
-// Stopped-state phrases take priority: negated forms ("not running", "isn't
-// up", "not healthy", "not alive"), explicit stopped words and down/boolean
-// phrases classify as down before positive words are consulted. Hyphenated
-// compounds such as "up-to-date" do not terminate the state word and so are
-// not state claims.
+// classifyContainerClauseState parses the state claim(s) of one clause,
+// returning the claim direction and the byte offset of the matched phrase.
+// Stopped-state phrases take priority within the same text span: negated
+// forms ("not running", "isn't up", "not healthy", "not alive"), explicit
+// stopped words and down/boolean phrases classify as down before positive
+// words are consulted, so a negated phrase cannot be double counted as up.
+// Hyphenated compounds such as "up-to-date" do not terminate the state word
+// and so are not state claims. When a single clause carries claims in both
+// directions ("redis is running but stopped", or "redis and demo-api are
+// running but demo-api is stopped"), the claim is ambiguous and the clause
+// carries no usable state; repeated same-direction claims ("running and
+// healthy") remain a single up/down claim.
 func classifyContainerClauseState(clause string) (string, int, bool) {
-	if loc := containerNegatedClaimRe.FindStringIndex(clause); loc != nil {
-		return containerStateDown, loc[0], true
+	// Collect every down-claim span first, starting with the negated forms
+	// that consume phrases such as "not running". Down spans are masked out
+	// before up-claim matching so the same text can never count twice.
+	masked := []byte(clause)
+	downSpans := collectDownClaimSpans(clause)
+	for _, span := range downSpans {
+		for i := span[0]; i < span[1] && i < len(masked); i++ {
+			masked[i] = ' '
+		}
 	}
-	if idx := strings.Index(clause, "exited"); idx >= 0 {
-		return containerStateDown, idx, true
+	remaining := string(masked)
+	upLoc := containerUpClaimRe.FindStringIndex(remaining)
+	if len(downSpans) > 0 && upLoc != nil {
+		// Opposite directions inside one clause: no unique state to verify.
+		return "", 0, false
 	}
-	if idx := strings.Index(clause, "stopped"); idx >= 0 {
-		return containerStateDown, idx, true
+	if len(downSpans) > 0 {
+		return containerStateDown, downSpans[0][0], true
 	}
-	if loc := containerDownClaimRe.FindStringIndex(clause); loc != nil {
-		return containerStateDown, loc[0], true
-	}
-	if loc := containerUpClaimRe.FindStringIndex(clause); loc != nil {
-		return containerStateUp, loc[0], true
+	if upLoc != nil {
+		return containerStateUp, upLoc[0], true
 	}
 	return "", 0, false
+}
+
+// collectDownClaimSpans returns the [start,end) byte spans of every
+// stopped-state claim in the clause, ordered by position. Negated phrases
+// are recorded first so their words are masked before other patterns run;
+// "exited"/"stopped" keep the historical literal-substring semantics of the
+// previous strings.Index lookups.
+func collectDownClaimSpans(clause string) [][2]int {
+	var spans [][2]int
+	for _, loc := range containerNegatedClaimRe.FindAllStringIndex(clause, -1) {
+		spans = append(spans, [2]int{loc[0], loc[1]})
+	}
+	for _, loc := range containerStoppedWordRe.FindAllStringIndex(clause, -1) {
+		spans = append(spans, [2]int{loc[0], loc[1]})
+	}
+	for _, loc := range containerDownClaimRe.FindAllStringIndex(clause, -1) {
+		spans = append(spans, [2]int{loc[0], loc[1]})
+	}
+	return mergeOverlappingSpans(spans)
+}
+
+// mergeOverlappingSpans sorts and unions overlapping [start,end) spans so a
+// text range matched by more than one down pattern is counted once.
+func mergeOverlappingSpans(spans [][2]int) [][2]int {
+	if len(spans) < 2 {
+		return spans
+	}
+	for i := 1; i < len(spans); i++ {
+		for j := i; j > 0 && spans[j-1][0] > spans[j][0]; j-- {
+			spans[j-1], spans[j] = spans[j], spans[j-1]
+		}
+	}
+	merged := make([][2]int, 0, len(spans))
+	merged = append(merged, spans[0])
+	for _, s := range spans[1:] {
+		last := &merged[len(merged)-1]
+		if s[0] <= last[1] {
+			if s[1] > last[1] {
+				last[1] = s[1]
+			}
+			continue
+		}
+		merged = append(merged, s)
+	}
+	return merged
+}
+
+// redisReferenceIndex returns the byte offset of the earliest redis
+// self-reference in the clause, or -1 when none is present.
+func redisReferenceIndex(clause string) int {
+	loc := redisSelfReferenceRe.FindStringIndex(clause)
+	if loc == nil {
+		return -1
+	}
+	return loc[0]
+}
+
+// appReferenceIndex returns the byte offset of the earliest application
+// container self-reference ("app", "application", "demo-api", "demo api")
+// in the clause, or -1 when none is present.
+func appReferenceIndex(clause string) int {
+	loc := appSelfReferenceRe.FindStringIndex(clause)
+	if loc == nil {
+		return -1
+	}
+	return loc[0]
 }
 
 // coordinatedBothContainerClaim reports whether a clause naming both
@@ -553,11 +642,8 @@ func classifyContainerClauseState(clause string) (string, int, bool) {
 // Both container names must occur before the state phrase, joined by a
 // coordinating conjunction and followed by the plural verb "are".
 func coordinatedBothContainerClaim(clause string, stateIdx int) bool {
-	redisIdx := strings.Index(clause, "redis")
-	appIdx := strings.Index(clause, "demo-api")
-	if appIdx < 0 {
-		appIdx = strings.Index(clause, "app")
-	}
+	redisIdx := redisReferenceIndex(clause)
+	appIdx := appReferenceIndex(clause)
 	if redisIdx < 0 || appIdx < 0 || stateIdx < 0 {
 		return false
 	}

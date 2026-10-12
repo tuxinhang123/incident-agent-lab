@@ -676,3 +676,222 @@ func TestValidateFaultEvidenceRejectsUnknownAcceptsRedisDown(t *testing.T) {
 		t.Fatalf("redis_not_running must stay accepted on fault evidence, got ok=%v %+v", ok, got)
 	}
 }
+
+// TestVerifyContainerEvidenceAppSubstringWords guards against ordinary
+// English words that merely contain "app" (appears/apparently/apply/happened)
+// being bound to the application container, and covers the explicit app
+// self-reference aliases.
+func TestVerifyContainerEvidenceAppSubstringWords(t *testing.T) {
+	cases := []struct {
+		name         string
+		fact         string
+		redisRunning bool
+		appRunning   bool
+		includeApp   bool
+		want         bool
+	}{
+		{
+			name:         "appears healthy binds redis only and passes when redis running",
+			fact:         "redis is running and appears healthy",
+			redisRunning: true,
+			appRunning:   false,
+			includeApp:   false,
+			want:         true,
+		},
+		{
+			name:         "appears healthy binds redis only and fails when redis stopped",
+			fact:         "redis is running and appears healthy",
+			redisRunning: false,
+			appRunning:   true,
+			includeApp:   false,
+			want:         false,
+		},
+		{
+			name:         "apparently is not an app reference",
+			fact:         "redis apparently healthy",
+			redisRunning: true,
+			appRunning:   false,
+			includeApp:   false,
+			want:         true,
+		},
+		{
+			name:         "redis and appears are running is a single redis claim",
+			fact:         "redis and appears are running",
+			redisRunning: true,
+			appRunning:   false,
+			includeApp:   false,
+			want:         true,
+		},
+		{
+			name:         "happened apply appears sentence names no container",
+			fact:         "a snapp startup happened; apply appears done",
+			redisRunning: true,
+			appRunning:   true,
+			includeApp:   true,
+			want:         false,
+		},
+		{
+			name:         "standalone app word binds the application container",
+			fact:         "the app is running",
+			redisRunning: false,
+			appRunning:   true,
+			includeApp:   true,
+			want:         true,
+		},
+		{
+			name:         "application alias binds the application container",
+			fact:         "application is running",
+			redisRunning: false,
+			appRunning:   true,
+			includeApp:   true,
+			want:         true,
+		},
+		{
+			name:         "spaced demo api alias binds the application container",
+			fact:         "demo api is running",
+			redisRunning: false,
+			appRunning:   true,
+			includeApp:   true,
+			want:         true,
+		},
+		{
+			name:         "coordinated claim with standalone app word",
+			fact:         "redis and app are running",
+			redisRunning: true,
+			appRunning:   true,
+			includeApp:   true,
+			want:         true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &model.CollectedEvidence{
+				RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: tc.redisRunning},
+			}
+			if tc.includeApp {
+				ev.AppStatus = &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: tc.appRunning}
+			}
+			if got := verifyContainerEvidence(tc.fact, ev); got != tc.want {
+				t.Fatalf("verifyContainerEvidence(%q) = %v, want %v", tc.fact, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVerifyContainerEvidenceContradictorySameClause rejects facts whose
+// state words point in both directions inside one clause, while different
+// clauses separated by punctuation may still carry different directions.
+func TestVerifyContainerEvidenceContradictorySameClause(t *testing.T) {
+	contradictoryCoordinated := "redis and demo-api are running but demo-api is stopped"
+	for _, obs := range []struct {
+		name         string
+		redisRunning bool
+		appRunning   bool
+	}{
+		{"both running", true, true},
+		{"redis running app stopped", true, false},
+		{"redis stopped app running", false, true},
+		{"both stopped", false, false},
+	} {
+		t.Run("coordinated contradiction "+obs.name, func(t *testing.T) {
+			ev := &model.CollectedEvidence{
+				RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: obs.redisRunning},
+				AppStatus:   &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: obs.appRunning},
+			}
+			if verifyContainerEvidence(contradictoryCoordinated, ev) {
+				t.Fatalf("contradictory clause %q must be rejected for every observation combination", contradictoryCoordinated)
+			}
+		})
+	}
+
+	singleContradiction := []string{
+		"redis is running but stopped",
+		"redis is running but it is down",
+	}
+	for _, fact := range singleContradiction {
+		for _, running := range []bool{true, false} {
+			ev := &model.CollectedEvidence{
+				RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: running},
+			}
+			if verifyContainerEvidence(fact, ev) {
+				t.Fatalf("single-container contradiction %q must be rejected (redis running=%v)", fact, running)
+			}
+		}
+	}
+
+	regression := []struct {
+		name         string
+		fact         string
+		redisRunning bool
+		appRunning   bool
+		want         bool
+	}{
+		{
+			name:         "separate clauses may point in different directions",
+			fact:         "redis is running; demo-api is stopped",
+			redisRunning: true,
+			appRunning:   false,
+			want:         true,
+		},
+		{
+			name:         "coordinated plural both running",
+			fact:         "redis and demo-api are running",
+			redisRunning: true,
+			appRunning:   true,
+			want:         true,
+		},
+		{
+			name:         "coordinated plural app stopped",
+			fact:         "redis and demo-api are running",
+			redisRunning: true,
+			appRunning:   false,
+			want:         false,
+		},
+		{
+			name:         "coordinated plural redis stopped",
+			fact:         "redis and demo-api are running",
+			redisRunning: false,
+			appRunning:   true,
+			want:         false,
+		},
+		{
+			name:         "same-direction repetition is one up claim",
+			fact:         "redis is running and healthy",
+			redisRunning: true,
+			appRunning:   true,
+			want:         true,
+		},
+		{
+			name:         "negated demo-api claim stays down",
+			fact:         "demo-api is not running",
+			redisRunning: true,
+			appRunning:   false,
+			want:         true,
+		},
+		{
+			name:         "isnt healthy stays a down claim",
+			fact:         "demo-api isnt healthy",
+			redisRunning: true,
+			appRunning:   false,
+			want:         true,
+		},
+		{
+			name:         "curly apostrophe negation stays a down claim",
+			fact:         "demo-api isn\u2019t running",
+			redisRunning: true,
+			appRunning:   false,
+			want:         true,
+		},
+	}
+	for _, tc := range regression {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := &model.CollectedEvidence{
+				RedisStatus: &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: tc.redisRunning},
+				AppStatus:   &model.ContainerObservation{Source: ToolContainerGet, OK: true, Running: tc.appRunning},
+			}
+			if got := verifyContainerEvidence(tc.fact, ev); got != tc.want {
+				t.Fatalf("verifyContainerEvidence(%q) = %v, want %v", tc.fact, got, tc.want)
+			}
+		})
+	}
+}
