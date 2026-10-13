@@ -144,7 +144,10 @@ func runDiagnose(argv []string, runID string, audit *agent.AuditLog) error {
 		fmt.Fprintf(os.Stderr, "warning: model disabled: %v\n", mErr)
 	}
 
-	report := agent.Run(ctx, runID, cfg, chat, audit)
+	report, err := agent.Run(ctx, runID, cfg, chat, audit)
+	if err != nil {
+		return err
+	}
 	return agent.EncodeJSON(os.Stdout, report)
 }
 

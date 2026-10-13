@@ -82,13 +82,18 @@ make build
 
 工具错误统一归类为：`timeout` / `connection_failed` / `container_not_found` / `docker_unavailable` / `invalid_input` / `internal_error`。所有工具都有超时（HTTP 默认 3s 上限 10s；docker 命令 5-8s）、输入校验与输出大小上限（body 摘要 200 字符、日志最多 20 个错误组）。
 
-## Agent 诊断工作流（Day 3，Eino）
+## Agent 诊断工作流（Day 3-4，Eino）
 
-三个工具通过 [Eino](https://github.com/cloudwego/eino) `utils.InferTool` 注册为带 JSON Schema 的 InvokableTool，由固定顺序工作流调用：
+三个工具通过 [Eino](https://github.com/cloudwego/eino) `utils.InferTool` 注册为带 JSON Schema 的 InvokableTool。证据采集不是模型自由选工具，而是通过 Eino `compose.ToolsNode` 执行一份固定有序的步骤表（Day 4）：
 
 ```
-HTTP 三接口 → 应用错误日志聚合 → Redis/应用容器状态 → 诊断 → 规则校验 → 结构化输出
+check_http(/health → /ready → /api/data) → query_service_logs → get_container_status(redis → app)
+                                                              ↓
+                                            CollectedEvidence → 诊断 → 规则校验 → Report
 ```
+
+- **固定编排**：[toolnode.go](internal/agent/toolnode.go) 的 `FixedWorkflowToolNode` 逐步构造 Assistant ToolCall 消息交给真实 ToolsNode 执行，工具顺序在代码中确定、模型不能改；启动时校验每个步骤引用的工具均已注册。工具失败以 `{ok:false}` 信封返回而非框架错误，因此 6 个步骤始终全部执行，失败降级为观测。
+- **执行轨迹**：Report 新增 `trace`，逐步记录 step/tool/ok/error_type/latency_ms，与审计 JSONL 一起支撑 Day 6 的运行可观测性。
 
 诊断器分两层：
 - **规则诊断器（默认，无需模型）**：基于采集到的 HTTP 状态码、日志错误类型和容器状态做确定性判断，输出根因枚举，保证无 API Key 也能跑通闭环，也是评测基线。
@@ -132,8 +137,8 @@ make test
 
 - Day 1：Go 服务 + Redis + Compose，稳定复现"Redis 停止"故障
 - Day 2：三个只读诊断工具（容器状态、日志聚合、HTTP 检查）+ CLI 与调用审计
-- Day 3：接入 Eino——工具注册为 InvokableTool，固定顺序收集证据，ChatModel（OpenAI 兼容）+ 证据规则校验，无 Key 时确定性规则诊断（当前）
-- Day 4：固定顺序工作流与证据聚合、规则校验（已随 Day 3 落地）
+- Day 3：接入 Eino——工具注册为 InvokableTool，ChatModel（OpenAI 兼容）+ 证据规则校验，无 Key 时确定性规则诊断
+- Day 4（当前）：固定工作流经 compose.ToolsNode 编排执行（工具不可由模型选择），Report 输出逐步执行轨迹 trace
 - Day 5：5 个离线评测 Case
 - Day 6-7：运行可观测性（Run ID/工具轨迹审计已有）、文档与演示
 

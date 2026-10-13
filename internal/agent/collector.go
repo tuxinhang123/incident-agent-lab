@@ -1,7 +1,11 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
 	"time"
+
+	"github.com/cloudwego/eino/components/tool"
 
 	"github.com/tuxinhang123/incident-agent-lab/internal/model"
 	"github.com/tuxinhang123/incident-agent-lab/internal/tools"
@@ -32,38 +36,162 @@ type AuditSink interface {
 	Record(runID, tool string, args map[string]any, started time.Time, result any, toolErr *model.ToolError) error
 }
 
-// CollectEvidence runs the fixed workflow order from the design doc:
+// CollectResult bundles the gathered evidence with the execution trace.
+type CollectResult struct {
+	Evidence *model.CollectedEvidence
+	Trace    []TraceEntry
+}
+
+// observationBag is filled by per-step delivery callbacks while the fixed
+// workflow runs through the Eino ToolsNode.
+type observationBag struct {
+	ready   *model.HTTPCheckObservation
+	data    *model.HTTPCheckObservation
+	health  *model.HTTPCheckObservation
+	appLogs *model.LogObservation
+	redis   *model.ContainerObservation
+	app     *model.ContainerObservation
+}
+
+func (b *observationBag) toEvidence() *model.CollectedEvidence {
+	return &model.CollectedEvidence{
+		Ready:       b.ready,
+		Data:        b.data,
+		Health:      b.health,
+		AppLogs:     b.appLogs,
+		RedisStatus: b.redis,
+		AppStatus:   b.app,
+	}
+}
+
+// CollectEvidence runs the fixed workflow via the Eino ToolsNode:
 // HTTP endpoints -> app error logs -> dependency/app container status.
 // Tool failures never abort the run; they become observations so the
 // diagnoser can report insufficient_evidence.
-func CollectEvidence(runID string, cfg TargetConfig, audit AuditSink) *model.CollectedEvidence {
-	ev := &model.CollectedEvidence{}
+func CollectEvidence(ctx context.Context, runID string, cfg TargetConfig, audit AuditSink) (*CollectResult, error) {
+	registered, err := RegisteredTools()
+	if err != nil {
+		return nil, err
+	}
+	baseTools := make([]tool.BaseTool, len(registered))
+	for i, t := range registered {
+		baseTools[i] = t
+	}
 
-	// 1. HTTP endpoints: readiness first (dependency check), then business.
-	ev.Health = observeHTTP(runID, audit, "/health", cfg.BaseURL+"/health", cfg.HTTPTimeoutMS)
-	ev.Ready = observeHTTP(runID, audit, "/ready", cfg.BaseURL+"/ready", cfg.HTTPTimeoutMS)
-	ev.Data = observeHTTP(runID, audit, "/api/data", cfg.BaseURL+"/api/data", cfg.HTTPTimeoutMS)
-
-	// 2. Aggregated application error logs.
-	ev.AppLogs = observeLogs(runID, audit, cfg.AppContainer, cfg.LogTailLines)
-
-	// 3. Dependency container status, then the app container itself.
-	ev.RedisStatus = observeContainer(runID, audit, "redis", cfg.RedisContainer)
-	ev.AppStatus = observeContainer(runID, audit, "app", cfg.AppContainer)
-
-	return ev
+	steps := buildFixedSteps(cfg, runID, audit)
+	node, err := NewFixedWorkflowToolNode(ctx, baseTools, steps.toolSteps())
+	if err != nil {
+		return nil, err
+	}
+	bag, trace, err := node.Run(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &CollectResult{Evidence: bag.toEvidence(), Trace: trace}, nil
 }
 
-func observeHTTP(runID string, audit AuditSink, label, url string, timeoutMS int) *model.HTTPCheckObservation {
-	in := tools.HTTPEndpointInput{URL: url, TimeoutMS: timeoutMS}
-	started := time.Now()
-	res, tErr := tools.CheckHTTPEndpoint(in)
-	auditRecord(audit, runID, ToolCheckHTTP, map[string]any{"url": url, "label": label}, started, res, tErr)
+// stepSpec is a ToolStep plus its start timestamp, captured before the
+// ToolsNode runs the call so latency includes only tool execution.
+type stepSpec struct {
+	step    ToolStep
+	started time.Time
+}
+
+// fixedSteps holds the ordered deterministic workflow steps.
+type fixedSteps struct {
+	items []stepSpec
+}
+
+func buildFixedSteps(cfg TargetConfig, runID string, audit AuditSink) *fixedSteps {
+	fs := &fixedSteps{}
+
+	httpStep := func(label, url string, sink func(*model.HTTPCheckObservation, *observationBag)) {
+		started := nowFn()
+		args := map[string]any{"url": url, "label": label}
+		fs.items = append(fs.items, stepSpec{
+			started: started,
+			step: ToolStep{
+				Name:      ToolCheckHTTP,
+				Arguments: args,
+				Deliver: func(env *toolEnvelope, raw json.RawMessage, bag *observationBag) {
+					auditEnvelope(audit, runID, ToolCheckHTTP, args, started, env, raw)
+					sink(httpObservation(env, raw), bag)
+				},
+			},
+		})
+	}
+
+	httpStep("/health", cfg.BaseURL+"/health", func(o *model.HTTPCheckObservation, bag *observationBag) {
+		bag.health = o
+	})
+	httpStep("/ready", cfg.BaseURL+"/ready", func(o *model.HTTPCheckObservation, bag *observationBag) {
+		bag.ready = o
+	})
+	httpStep("/api/data", cfg.BaseURL+"/api/data", func(o *model.HTTPCheckObservation, bag *observationBag) {
+		bag.data = o
+	})
+
+	{
+		started := nowFn()
+		args := map[string]any{"service": cfg.AppContainer, "tail": cfg.LogTailLines}
+		fs.items = append(fs.items, stepSpec{
+			started: started,
+			step: ToolStep{
+				Name: ToolServiceLogs, Arguments: args,
+				Deliver: func(env *toolEnvelope, raw json.RawMessage, bag *observationBag) {
+					auditEnvelope(audit, runID, ToolServiceLogs, args, started, env, raw)
+					bag.appLogs = logsObservation(env, raw)
+				},
+			},
+		})
+	}
+	containerStep := func(label, name string, sink func(*model.ContainerObservation, *observationBag)) {
+		started := nowFn()
+		args := map[string]any{"container": name, "label": label}
+		fs.items = append(fs.items, stepSpec{
+			started: started,
+			step: ToolStep{
+				Name: ToolContainerGet, Arguments: args,
+				Deliver: func(env *toolEnvelope, raw json.RawMessage, bag *observationBag) {
+					auditEnvelope(audit, runID, ToolContainerGet, args, started, env, raw)
+					sink(containerObservation(env, raw), bag)
+				},
+			},
+		})
+	}
+	containerStep("redis", cfg.RedisContainer, func(o *model.ContainerObservation, bag *observationBag) {
+		bag.redis = o
+	})
+	containerStep("app", cfg.AppContainer, func(o *model.ContainerObservation, bag *observationBag) {
+		bag.app = o
+	})
+
+	return fs
+}
+
+func (fs *fixedSteps) toolSteps() []ToolStep {
+	out := make([]ToolStep, len(fs.items))
+	for i, s := range fs.items {
+		out[i] = s.step
+	}
+	return out
+}
+
+func httpObservation(env *toolEnvelope, raw json.RawMessage) *model.HTTPCheckObservation {
 	o := &model.HTTPCheckObservation{Source: ToolCheckHTTP}
-	if tErr != nil {
+	if env == nil || !env.OK {
 		o.OK = false
-		o.ErrorType = tErr.Type
-		o.Summary = tErr.Message
+		if env != nil {
+			o.ErrorType = env.ErrorType
+			o.Summary = env.ErrorMsg
+		}
+		return o
+	}
+	var res tools.HTTPEndpointResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		o.OK = false
+		o.ErrorType = model.ErrorTypeInternal
+		o.Summary = err.Error()
 		return o
 	}
 	o.OK = true
@@ -72,15 +200,19 @@ func observeHTTP(runID string, audit AuditSink, label, url string, timeoutMS int
 	return o
 }
 
-func observeLogs(runID string, audit AuditSink, service string, tail int) *model.LogObservation {
-	in := tools.ServiceLogsInput{Service: service, Tail: tail}
-	started := time.Now()
-	res, tErr := tools.QueryServiceLogs(in)
-	auditRecord(audit, runID, ToolServiceLogs, map[string]any{"service": service, "tail": tail}, started, res, tErr)
+func logsObservation(env *toolEnvelope, raw json.RawMessage) *model.LogObservation {
 	o := &model.LogObservation{Source: ToolServiceLogs}
-	if tErr != nil {
+	if env == nil || !env.OK {
 		o.OK = false
-		o.ErrorType = tErr.Type
+		if env != nil {
+			o.ErrorType = env.ErrorType
+		}
+		return o
+	}
+	var res tools.ServiceLogsResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		o.OK = false
+		o.ErrorType = model.ErrorTypeInternal
 		return o
 	}
 	o.OK = true
@@ -93,15 +225,19 @@ func observeLogs(runID string, audit AuditSink, service string, tail int) *model
 	return o
 }
 
-func observeContainer(runID string, audit AuditSink, label, container string) *model.ContainerObservation {
-	in := tools.ContainerStatusInput{Container: container}
-	started := time.Now()
-	res, tErr := tools.GetContainerStatus(in)
-	auditRecord(audit, runID, ToolContainerGet, map[string]any{"container": container, "label": label}, started, res, tErr)
+func containerObservation(env *toolEnvelope, raw json.RawMessage) *model.ContainerObservation {
 	o := &model.ContainerObservation{Source: ToolContainerGet}
-	if tErr != nil {
+	if env == nil || !env.OK {
 		o.OK = false
-		o.ErrorType = tErr.Type
+		if env != nil {
+			o.ErrorType = env.ErrorType
+		}
+		return o
+	}
+	var res tools.ContainerStatusResult
+	if err := json.Unmarshal(raw, &res); err != nil {
+		o.OK = false
+		o.ErrorType = model.ErrorTypeInternal
 		return o
 	}
 	o.OK = true
@@ -114,9 +250,32 @@ func observeContainer(runID string, audit AuditSink, label, container string) *m
 	return o
 }
 
-func auditRecord(audit AuditSink, runID, tool string, args map[string]any, started time.Time, result any, tErr *model.ToolError) {
-	if audit == nil {
+// auditEnvelope replays one typed tool call into the audit sink.
+func auditEnvelope(audit AuditSink, runID, name string, args map[string]any, started time.Time, env *toolEnvelope, raw json.RawMessage) {
+	if audit == nil || env == nil {
 		return
 	}
-	_ = audit.Record(runID, tool, args, started, result, tErr)
+	var result any
+	switch name {
+	case ToolCheckHTTP:
+		var r tools.HTTPEndpointResult
+		if env.OK && json.Unmarshal(raw, &r) == nil {
+			result = &r
+		}
+	case ToolServiceLogs:
+		var r tools.ServiceLogsResult
+		if env.OK && json.Unmarshal(raw, &r) == nil {
+			result = &r
+		}
+	case ToolContainerGet:
+		var r tools.ContainerStatusResult
+		if env.OK && json.Unmarshal(raw, &r) == nil {
+			result = &r
+		}
+	}
+	var tErr *model.ToolError
+	if !env.OK {
+		tErr = &model.ToolError{Type: env.ErrorType, Message: env.ErrorMsg}
+	}
+	_ = audit.Record(runID, name, args, started, result, tErr)
 }

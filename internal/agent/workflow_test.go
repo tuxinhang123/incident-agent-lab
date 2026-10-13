@@ -52,7 +52,10 @@ func TestRunWorkflowFaultWithoutDocker(t *testing.T) {
 		HTTPTimeoutMS:  2000,
 		LogTailLines:   50,
 	}
-	report := Run(context.Background(), "test-run-fault", cfg, nil, nil)
+	report, err := Run(context.Background(), "test-run-fault", cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
 
 	if report.DiagnosisSource != "rules" {
 		t.Fatalf("without a chat model source must be rules, got %q", report.DiagnosisSource)
@@ -77,7 +80,10 @@ func TestRunWorkflowHealthy(t *testing.T) {
 	defer srv.Close()
 
 	cfg := TargetConfig{BaseURL: srv.URL, HTTPTimeoutMS: 2000}
-	report := Run(context.Background(), "test-run-healthy", cfg, nil, nil)
+	report, err := Run(context.Background(), "test-run-healthy", cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
 	if report.Diagnosis.RootCause != model.CauseNone || report.Diagnosis.Status != model.StatusHealthy {
 		t.Fatalf("want no_incident, got %+v", report.Diagnosis)
 	}
@@ -111,6 +117,25 @@ func TestEinoToolRegistration(t *testing.T) {
 	for name, seen := range want {
 		if !seen {
 			t.Fatalf("tool %s not registered", name)
+		}
+	}
+}
+
+func TestRunWorkflowIncludesOrderedTrace(t *testing.T) {
+	srv := fakeFaultyAPI()
+	defer srv.Close()
+	cfg := TargetConfig{BaseURL: srv.URL, AppContainer: "ial-demo-api", RedisContainer: "ial-redis", HTTPTimeoutMS: 2000, LogTailLines: 50}
+	report, err := Run(context.Background(), "trace-run", cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	want := []string{ToolCheckHTTP, ToolCheckHTTP, ToolCheckHTTP, ToolServiceLogs, ToolContainerGet, ToolContainerGet}
+	if len(report.Trace) != len(want) {
+		t.Fatalf("want %d trace entries, got %+v", len(want), report.Trace)
+	}
+	for i, name := range want {
+		if report.Trace[i].Tool != name || report.Trace[i].Step != i+1 {
+			t.Fatalf("trace %d: want %s, got %+v", i, name, report.Trace[i])
 		}
 	}
 }
