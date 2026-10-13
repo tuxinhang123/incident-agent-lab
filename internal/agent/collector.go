@@ -107,14 +107,18 @@ func buildFixedSteps(cfg TargetConfig, runID string, audit AuditSink) *fixedStep
 
 	httpStep := func(label, url string, sink func(*model.HTTPCheckObservation, *observationBag)) {
 		started := nowFn()
-		args := map[string]any{"url": url, "label": label}
+		// Arguments carries only the tool's schema fields; the label is
+		// collector-only metadata and stays out of the tool call.
+		toolArgs := map[string]any{"url": url, "timeout_ms": cfg.HTTPTimeoutMS}
+		auditArgs := map[string]any{"url": url, "label": label, "timeout_ms": cfg.HTTPTimeoutMS}
 		fs.items = append(fs.items, stepSpec{
 			started: started,
 			step: ToolStep{
 				Name:      ToolCheckHTTP,
-				Arguments: args,
+				Arguments: toolArgs,
+				AuditArgs: auditArgs,
 				Deliver: func(env *toolEnvelope, raw json.RawMessage, bag *observationBag) {
-					auditEnvelope(audit, runID, ToolCheckHTTP, args, started, env, raw)
+					auditEnvelope(audit, runID, ToolCheckHTTP, auditArgs, started, env, raw)
 					sink(httpObservation(env, raw), bag)
 				},
 			},
@@ -133,7 +137,7 @@ func buildFixedSteps(cfg TargetConfig, runID string, audit AuditSink) *fixedStep
 
 	{
 		started := nowFn()
-		args := map[string]any{"service": cfg.AppContainer, "tail": cfg.LogTailLines}
+		args := map[string]any{"service": cfg.AppContainer, "tail_lines": cfg.LogTailLines}
 		fs.items = append(fs.items, stepSpec{
 			started: started,
 			step: ToolStep{
@@ -147,13 +151,14 @@ func buildFixedSteps(cfg TargetConfig, runID string, audit AuditSink) *fixedStep
 	}
 	containerStep := func(label, name string, sink func(*model.ContainerObservation, *observationBag)) {
 		started := nowFn()
-		args := map[string]any{"container": name, "label": label}
+		toolArgs := map[string]any{"container": name}
+		auditArgs := map[string]any{"container": name, "label": label}
 		fs.items = append(fs.items, stepSpec{
 			started: started,
 			step: ToolStep{
-				Name: ToolContainerGet, Arguments: args,
+				Name: ToolContainerGet, Arguments: toolArgs, AuditArgs: auditArgs,
 				Deliver: func(env *toolEnvelope, raw json.RawMessage, bag *observationBag) {
-					auditEnvelope(audit, runID, ToolContainerGet, args, started, env, raw)
+					auditEnvelope(audit, runID, ToolContainerGet, auditArgs, started, env, raw)
 					sink(containerObservation(env, raw), bag)
 				},
 			},

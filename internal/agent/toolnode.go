@@ -14,9 +14,16 @@ import (
 // name (as registered in Eino), its JSON arguments and a delivery callback
 // that maps the tool envelope into the evidence bag. Steps run sequentially
 // in slice order.
+//
+// Arguments holds exactly the tool's JSON-schema fields and is what gets
+// serialized into the Eino tool call. AuditArgs optionally carries the
+// arguments recorded in the audit trail when those include collector-only
+// metadata (e.g. a human-readable label) that is not part of the tool
+// schema; when nil, the audit trail records Arguments.
 type ToolStep struct {
 	Name      string
 	Arguments map[string]any
+	AuditArgs map[string]any
 	Deliver   func(env *toolEnvelope, raw json.RawMessage, bag *observationBag)
 }
 
