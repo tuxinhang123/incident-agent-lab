@@ -103,7 +103,7 @@ func (w *FixedWorkflowToolNode) Run(ctx context.Context) (*observationBag, []Tra
 		stepCtx := ctx
 		if w.tracer != nil {
 			stepCtx, stepSpan = w.tracer.StartSpan(ctx, "tool:"+step.Name, spanTypeTool,
-				map[string]any{"tool": step.Name, "step": i + 1}, step.Arguments)
+				map[string]any{"tool": step.Name, "step": i + 1}, redactArgs(step.Arguments))
 		}
 		out, err := w.node.Invoke(stepCtx, msg)
 		latencyMS := timeSinceMS(started)
@@ -135,7 +135,7 @@ func (w *FixedWorkflowToolNode) Run(ctx context.Context) (*observationBag, []Tra
 			step.Deliver(env, raw, bag)
 		}
 		if stepSpan != nil {
-			stepSpan.SetOutput(stepCtx, env)
+			stepSpan.SetOutput(stepCtx, redactResult(env))
 			if !env.OK {
 				stepSpan.SetStatusCode(stepCtx, 1)
 			}
