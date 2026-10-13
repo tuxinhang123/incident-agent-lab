@@ -13,6 +13,7 @@ import (
 
 	"github.com/tuxinhang123/incident-agent-lab/internal/agent"
 	"github.com/tuxinhang123/incident-agent-lab/internal/model"
+	"github.com/tuxinhang123/incident-agent-lab/internal/observability"
 	"github.com/tuxinhang123/incident-agent-lab/internal/tools"
 )
 
@@ -139,12 +140,22 @@ func runDiagnose(argv []string, runID string, audit *agent.AuditLog) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	chat, mErr := agent.NewChatModel(ctx, agent.LoadModelConfig())
+	modelCfg := agent.LoadModelConfig()
+	chat, mErr := agent.NewChatModel(ctx, modelCfg)
 	if mErr != nil {
 		fmt.Fprintf(os.Stderr, "warning: model disabled: %v\n", mErr)
 	}
+	modelName := ""
+	if modelCfg != nil {
+		modelName = modelCfg.Model
+	}
 
-	report, err := agent.Run(ctx, runID, cfg, chat, audit)
+	tracer := observability.New()
+	if tracer != nil {
+		defer tracer.Close(ctx)
+	}
+
+	report, err := agent.Run(ctx, runID, cfg, chat, modelName, audit, tracer)
 	if err != nil {
 		return err
 	}

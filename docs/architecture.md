@@ -14,6 +14,7 @@ V0 的目标是以最少的基础设施验证诊断闭环：
 - **Eino 工作流（Day 3-4）**：三个工具经 `utils.InferTool` 注册为 Eino InvokableTool（`internal/agent/einotools.go`）。固定顺序由 `FixedWorkflowToolNode`（`internal/agent/toolnode.go`）承载——它持有真实的 `compose.ToolsNode`，按 `buildFixedSteps`（`collector.go`）中的步骤表逐步发送单 ToolCall 的 Assistant 消息执行：HTTP 三接口 → 日志聚合 → Redis/应用容器状态，共 6 步。模型不能选择或增删工具；构造期校验步骤引用的工具名均已注册。
   - 工具失败不中断：工具把传输/分类错误封装为 `{ok:false,error_type}` 信封返回 Go nil，ToolsNode 不会因单步失败中止，失败结果成为 `CollectedEvidence` 中的失败观测。
   - `Report.trace` 逐步记录 step/tool/ok/error_type/latency_ms；每次工具调用另写脱敏审计 JSONL。
+- **Coze Loop 追踪（可选，Day 6 可观测性前置）**：`internal/observability` 用 cozeloop-go 适配包级 Tracer/Span 接口；仅当 `COZELOOP_API_TOKEN` 与 `COZELOOP_WORKSPACE_ID` 均存在时初始化，否则 `New()` 返回 nil，全流程无外部依赖。接入点：workflow 根 span `incident.diagnose`（workflow）、固定工作流每步工具 span（tool）、可选模型 span（model，记录 model_name 与 prompt/completion token）。tracing 失败不影响诊断结果。
   - 诊断器分两层：规则诊断器 `DiagnoseRules` 为确定性基线与回退；模型诊断器 `DiagnoseWithModel`（eino-ext openai，OpenAI 兼容）的输出经 `Validate` 与证据交叉校验（根因必须与规则基线一致、证据逐项可重建、status/confidence 合法），不通过即回退规则结论。
 
 ## 故障注入方式

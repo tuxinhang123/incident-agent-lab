@@ -8,6 +8,8 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
+
+	"github.com/tuxinhang123/incident-agent-lab/internal/observability"
 )
 
 // ToolStep is one deterministic call in the fixed workflow: the exact tool
@@ -43,13 +45,14 @@ type TraceEntry struct {
 // Assistant message carrying a single tool call, so invocation order equals
 // the ToolsNode input order and step results map back 1:1.
 type FixedWorkflowToolNode struct {
-	node  *compose.ToolsNode
-	steps []ToolStep
+	node   *compose.ToolsNode
+	steps  []ToolStep
+	tracer observability.Tracer
 }
 
 // NewFixedWorkflowToolNode builds the Eino ToolsNode from the registered
 // tools and validates that every step names a registered tool.
-func NewFixedWorkflowToolNode(ctx context.Context, tools []tool.BaseTool, steps []ToolStep) (*FixedWorkflowToolNode, error) {
+func NewFixedWorkflowToolNode(ctx context.Context, tools []tool.BaseTool, steps []ToolStep, tracer observability.Tracer) (*FixedWorkflowToolNode, error) {
 	registered := map[string]bool{}
 	for _, t := range tools {
 		info, err := t.Info(ctx)
@@ -67,7 +70,7 @@ func NewFixedWorkflowToolNode(ctx context.Context, tools []tool.BaseTool, steps 
 	if err != nil {
 		return nil, fmt.Errorf("create tools node: %w", err)
 	}
-	return &FixedWorkflowToolNode{node: node, steps: steps}, nil
+	return &FixedWorkflowToolNode{node: node, steps: steps, tracer: tracer}, nil
 }
 
 // Run executes every step in fixed order through the Eino ToolsNode and
@@ -93,21 +96,50 @@ func (w *FixedWorkflowToolNode) Run(ctx context.Context) (*observationBag, []Tra
 			},
 		}}
 		started := nowFn()
-		out, err := w.node.Invoke(ctx, msg)
+		// Each tool span is a child of the caller-provided root span; the
+		// loop ctx is intentionally not replaced so sibling steps do not
+		// nest inside each other.
+		var stepSpan observability.Span
+		stepCtx := ctx
+		if w.tracer != nil {
+			stepCtx, stepSpan = w.tracer.StartSpan(ctx, "tool:"+step.Name, spanTypeTool,
+				map[string]any{"tool": step.Name, "step": i + 1}, step.Arguments)
+		}
+		out, err := w.node.Invoke(stepCtx, msg)
 		latencyMS := timeSinceMS(started)
 		if err != nil {
+			if stepSpan != nil {
+				stepSpan.SetError(stepCtx, err)
+				stepSpan.SetStatusCode(stepCtx, 1)
+				stepSpan.Finish(stepCtx)
+			}
 			return nil, nil, fmt.Errorf("step %d (%s): %w", i, step.Name, err)
 		}
 		if len(out) != 1 {
+			if stepSpan != nil {
+				stepSpan.Finish(stepCtx)
+			}
 			return nil, nil, fmt.Errorf("step %d (%s): expected 1 tool message, got %d", i, step.Name, len(out))
 		}
 		env := &toolEnvelope{}
 		if err := json.Unmarshal([]byte(out[0].Content), env); err != nil {
+			if stepSpan != nil {
+				stepSpan.SetError(stepCtx, err)
+				stepSpan.SetStatusCode(stepCtx, 1)
+				stepSpan.Finish(stepCtx)
+			}
 			return nil, nil, fmt.Errorf("step %d (%s) parse result: %w", i, step.Name, err)
 		}
 		raw, _ := json.Marshal(env.Result)
 		if step.Deliver != nil {
 			step.Deliver(env, raw, bag)
+		}
+		if stepSpan != nil {
+			stepSpan.SetOutput(stepCtx, env)
+			if !env.OK {
+				stepSpan.SetStatusCode(stepCtx, 1)
+			}
+			stepSpan.Finish(stepCtx)
 		}
 		trace = append(trace, TraceEntry{
 			Step: i + 1, Tool: step.Name, OK: env.OK,

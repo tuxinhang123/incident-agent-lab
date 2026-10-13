@@ -61,7 +61,7 @@ func TestFixedWorkflowToolNodeOrderAndEnvelopes(t *testing.T) {
 			}},
 	}
 
-	node, err := NewFixedWorkflowToolNode(context.Background(), base, steps)
+	node, err := NewFixedWorkflowToolNode(context.Background(), base, steps, nil)
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestNewFixedWorkflowToolNodeRejectsUnknownStep(t *testing.T) {
 		base[i] = tl
 	}
 	steps := []ToolStep{{Name: "shell_exec", Arguments: map[string]any{}}}
-	if _, err := NewFixedWorkflowToolNode(context.Background(), base, steps); err == nil {
+	if _, err := NewFixedWorkflowToolNode(context.Background(), base, steps, nil); err == nil {
 		t.Fatal("unknown tool step must be rejected")
 	}
 }

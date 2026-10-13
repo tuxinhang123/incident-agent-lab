@@ -8,6 +8,7 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 
 	"github.com/tuxinhang123/incident-agent-lab/internal/model"
+	"github.com/tuxinhang123/incident-agent-lab/internal/observability"
 	"github.com/tuxinhang123/incident-agent-lab/internal/tools"
 )
 
@@ -68,7 +69,7 @@ func (b *observationBag) toEvidence() *model.CollectedEvidence {
 // HTTP endpoints -> app error logs -> dependency/app container status.
 // Tool failures never abort the run; they become observations so the
 // diagnoser can report insufficient_evidence.
-func CollectEvidence(ctx context.Context, runID string, cfg TargetConfig, audit AuditSink) (*CollectResult, error) {
+func CollectEvidence(ctx context.Context, runID string, cfg TargetConfig, audit AuditSink, tr observability.Tracer) (*CollectResult, error) {
 	registered, err := RegisteredTools()
 	if err != nil {
 		return nil, err
@@ -79,7 +80,7 @@ func CollectEvidence(ctx context.Context, runID string, cfg TargetConfig, audit 
 	}
 
 	steps := buildFixedSteps(cfg, runID, audit)
-	node, err := NewFixedWorkflowToolNode(ctx, baseTools, steps.toolSteps())
+	node, err := NewFixedWorkflowToolNode(ctx, baseTools, steps.toolSteps(), tr)
 	if err != nil {
 		return nil, err
 	}

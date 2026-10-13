@@ -10,7 +10,6 @@ import (
 
 	openai "github.com/cloudwego/eino-ext/components/model/openai"
 	cmodel "github.com/cloudwego/eino/components/model"
-	"github.com/cloudwego/eino/schema"
 
 	"github.com/tuxinhang123/incident-agent-lab/internal/model"
 )
@@ -70,37 +69,8 @@ Rules:
 {"status":"diagnosed|insufficient_evidence|no_incident","root_cause":"<taxonomy value>","confidence":0.0,"evidence":[{"source":"<tool name>","fact":"<short fact>"}],"suggested_actions":["..."]}
 - Use status "insufficient_evidence" with root_cause "unknown" when evidence does not support a specific cause.`
 
-// DiagnoseWithModel asks the model to interpret the collected evidence.
-// The returned diagnosis is always passed through Validate; when the model
-// is unavailable, output is invalid or contradicts evidence, the second
-// return value is false and the caller should use the rule-based result.
-func DiagnoseWithModel(ctx context.Context, m cmodel.ChatModel, ev *model.CollectedEvidence) (*model.Diagnosis, bool) {
-	if m == nil {
-		return nil, false
-	}
-	raw, err := json.Marshal(ev)
-	if err != nil {
-		return nil, false
-	}
-
-	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	out, err := m.Generate(callCtx, []*schema.Message{
-		schema.SystemMessage(diagnoseSystemPrompt),
-		schema.UserMessage("Collected evidence JSON:\n" + string(raw)),
-	})
-	if err != nil || out == nil {
-		return nil, false
-	}
-
-	d := parseModelDiagnosis(out.Content)
-	if d == nil {
-		return nil, false
-	}
-	validated, ok := Validate(d, ev)
-	return validated, ok
-}
+// modelCallTimeout bounds one LLM Generate call.
+const modelCallTimeout = 30 * time.Second
 
 func parseModelDiagnosis(content string) *model.Diagnosis {
 	s := strings.TrimSpace(content)
@@ -125,4 +95,12 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
 }

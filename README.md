@@ -117,6 +117,19 @@ OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://api.openai.com/v1 \
 
 `diagnose` 始终输出 Report JSON（`diagnosis_source` 标记 `rules`/`model`），单工具失败不中断流程；每次工具调用都写入审计 JSONL。
 
+### Coze Loop 追踪（可选）
+
+设置 Coze Loop（[cozeloop-go](https://github.com/coze-dev/cozeloop-go)）凭证后，`diagnose` 自动上报一条 trace，无需改命令：
+
+```bash
+export COZELOOP_API_TOKEN=pat_xxx          # PAT 或 JWT
+export COZELOOP_WORKSPACE_ID=<workspace id>
+# export COZELOOP_API_BASE_URL=https://api.coze.cn   # 私有化/海外时覆盖
+./bin/agent diagnose
+```
+
+trace 结构：根 span `incident.diagnose`（type `workflow`）→ 6 个固定工具子 span（type `tool`，含入参、信封输出、失败状态码）→ 启用模型时一个 `diagnose.llm` span（type `model`，含 model_name、prompt/completion tokens、校验回退标记）。未设置两个环境变量时追踪整体关闭（无网络请求、无凭证报错），诊断行为与审计 JSONL 不受影响。
+
 ## 无 Docker 环境的本地方式
 
 需要本机已安装 Go 和 redis-server：

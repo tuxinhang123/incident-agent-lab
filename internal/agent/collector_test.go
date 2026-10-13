@@ -135,7 +135,7 @@ func TestCollectEvidenceDefaultPropagationAndAudit(t *testing.T) {
 	cfg := DefaultTarget()
 	cfg.BaseURL = srv.URL
 
-	res, err := CollectEvidence(context.Background(), "run-e2e", cfg, audit)
+	res, err := CollectEvidence(context.Background(), "run-e2e", cfg, audit, nil)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}

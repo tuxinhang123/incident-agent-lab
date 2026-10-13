@@ -52,7 +52,7 @@ func TestRunWorkflowFaultWithoutDocker(t *testing.T) {
 		HTTPTimeoutMS:  2000,
 		LogTailLines:   50,
 	}
-	report, err := Run(context.Background(), "test-run-fault", cfg, nil, nil)
+	report, err := Run(context.Background(), "test-run-fault", cfg, nil, "", nil, nil)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestRunWorkflowHealthy(t *testing.T) {
 	defer srv.Close()
 
 	cfg := TargetConfig{BaseURL: srv.URL, HTTPTimeoutMS: 2000}
-	report, err := Run(context.Background(), "test-run-healthy", cfg, nil, nil)
+	report, err := Run(context.Background(), "test-run-healthy", cfg, nil, "", nil, nil)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestRunWorkflowIncludesOrderedTrace(t *testing.T) {
 	srv := fakeFaultyAPI()
 	defer srv.Close()
 	cfg := TargetConfig{BaseURL: srv.URL, AppContainer: "ial-demo-api", RedisContainer: "ial-redis", HTTPTimeoutMS: 2000, LogTailLines: 50}
-	report, err := Run(context.Background(), "trace-run", cfg, nil, nil)
+	report, err := Run(context.Background(), "trace-run", cfg, nil, "", nil, nil)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
