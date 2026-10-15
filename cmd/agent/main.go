@@ -137,7 +137,17 @@ func runDiagnose(argv []string, runID string, audit *agent.AuditLog) error {
 		LogTailLines:   *tail,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Total budget for the whole diagnose run. A multi-turn ReAct agent can
+	// issue several reasoning-model calls, so the default is generous; it is
+	// the parent deadline that also bounds the agent loop. Override with
+	// DIAGNOSE_TIMEOUT (e.g. "300s").
+	runTimeout := 180 * time.Second
+	if v := os.Getenv("DIAGNOSE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			runTimeout = d
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
 
 	modelCfg := agent.LoadModelConfig()

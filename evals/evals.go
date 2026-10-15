@@ -23,13 +23,15 @@ const (
 	VerdictError Verdict = "ERROR"
 )
 
-const expectedSource = "rules"
-
 // Options configures a suite run.
 type Options struct {
 	Mode      Mode
 	OnlyCase  string
 	KeepStack bool
+	// UseModel runs each diagnose through the LLM path instead of forcing
+	// the rules-only baseline. Requires model env vars (OPENAI_API_KEY etc.)
+	// to be present in the shell; the harness no longer strips them.
+	UseModel bool
 }
 
 // Totals counts verdicts across the suite.
@@ -99,10 +101,11 @@ func Run(ctx context.Context, opts Options) (*SuiteReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	h.useModel = opts.UseModel
 	if err := h.Gate(ctx); err != nil {
 		return nil, err
 	}
-	logf("eval mode: %s", h.Mode())
+	logf("eval mode: %s (model=%t)", h.Mode(), h.useModel)
 	h.cleanArtifacts()
 
 	logf("building bin/agent and bin/demo-api ...")
@@ -186,12 +189,19 @@ func (h *Harness) runCase(ctx context.Context, idx, total int, c Case) CaseResul
 	fmt.Println()
 	logf("[%d/%d] case: %s — %s", idx, total, c.ID, c.Title)
 
+	// The expected diagnosis source follows the configured path: rules for
+	// the deterministic baseline, model when the LLM path is exercised.
+	wantSource := "rules"
+	if h.useModel {
+		wantSource = "model"
+	}
+
 	res := CaseResult{
 		Index: c.Index, ID: c.ID, Title: c.Title, Question: c.Question,
 		Modes: modeNames(c.Modes),
 		Expected: Expected{
 			Status: c.ExpectedStatus, RootCause: c.ExpectedRootCause,
-			DiagnosisSource: expectedSource,
+			DiagnosisSource: wantSource,
 		},
 		Report: filepath.ToSlash(filepath.Join(".run", "evals", c.ID+"-report.json")),
 	}
@@ -272,8 +282,8 @@ func (h *Harness) runCase(ctx context.Context, idx, total int, c Case) CaseResul
 	if res.Actual.RootCause != c.ExpectedRootCause {
 		diffs = append(diffs, fmt.Sprintf("root_cause want=%q got=%q", c.ExpectedRootCause, res.Actual.RootCause))
 	}
-	if res.Actual.DiagnosisSource != expectedSource {
-		diffs = append(diffs, fmt.Sprintf("diagnosis_source want=%q got=%q", expectedSource, res.Actual.DiagnosisSource))
+	if res.Actual.DiagnosisSource != wantSource {
+		diffs = append(diffs, fmt.Sprintf("diagnosis_source want=%q got=%q", wantSource, res.Actual.DiagnosisSource))
 	}
 	if len(diffs) > 0 {
 		return finish(VerdictFail, strings.Join(diffs, "; "))
@@ -283,7 +293,9 @@ func (h *Harness) runCase(ctx context.Context, idx, total int, c Case) CaseResul
 
 // strippedEnv returns the process environment with model/tracing variables
 // removed, so a shell's API keys cannot perturb the rules-only baseline.
-func strippedEnv() []string {
+// When keepModel is true the model variables are passed through so the
+// diagnose CLI can take the LLM path.
+func strippedEnv(keepModel bool) []string {
 	drop := map[string]bool{
 		"OPENAI_API_KEY": true, "OPENAI_BASE_URL": true, "MODEL_NAME": true,
 		"COZELOOP_API_TOKEN": true, "COZELOOP_WORKSPACE_ID": true,
@@ -292,7 +304,7 @@ func strippedEnv() []string {
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
 		key, _, ok := strings.Cut(kv, "=")
-		if ok && drop[key] {
+		if ok && !keepModel && drop[key] {
 			continue
 		}
 		out = append(out, kv)
@@ -312,7 +324,7 @@ func (h *Harness) runAgent(ctx context.Context, c Case) ([]byte, []byte, int) {
 
 	cmd := exec.CommandContext(runCtx, filepath.Join(h.root, "bin", "agent"), args...)
 	cmd.Dir = h.root
-	cmd.Env = strippedEnv()
+	cmd.Env = strippedEnv(h.useModel)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

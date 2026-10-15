@@ -8,6 +8,8 @@ import (
 	"context"
 	"os"
 
+	ccb "github.com/cloudwego/eino-ext/callbacks/cozeloop"
+	"github.com/cloudwego/eino/callbacks"
 	cozeloop "github.com/coze-dev/cozeloop-go"
 )
 
@@ -78,6 +80,15 @@ func (c *Coze) StartSpan(ctx context.Context, name, spanType string, tags map[st
 
 func (c *Coze) Close(ctx context.Context) {
 	c.client.Close(ctx)
+}
+
+// EinoLoopHandler returns the official Eino callback handler that bridges
+// Eino component invocations (ChatModel / Tool / ADK Agent) to Coze Loop.
+// Attach it to a run via adk.WithCallbacks (or callbacks.AppendGlobalHandlers
+// for process-wide coverage). The handler auto-creates spans, records model
+// name/token usage, tool arguments and results — no manual span wiring needed.
+func (c *Coze) EinoLoopHandler() callbacks.Handler {
+	return ccb.NewLoopHandler(c.client)
 }
 
 type cozeSpan struct {

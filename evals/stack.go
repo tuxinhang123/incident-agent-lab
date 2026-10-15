@@ -51,6 +51,10 @@ type Harness struct {
 	// Per-case state, reset before each case runs.
 	targetOverride string
 	fault          FaultTarget
+
+	// useModel lets the diagnose CLI call the LLM instead of forcing the
+	// rules-only fallback.
+	useModel bool
 }
 
 func NewHarness(mode Mode) (*Harness, error) {

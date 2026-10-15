@@ -43,8 +43,13 @@ verify:
 
 # Day 5 offline eval suite: 5 cases with automatic env prep, fault
 # injection and a JSON report under .run/evals/.
+# Default runs the deterministic rules baseline; use eval-model to exercise
+# the LLM diagnosis path (requires OPENAI_API_KEY / OPENAI_BASE_URL / MODEL_NAME).
 eval:
 	go run ./cmd/eval
+
+eval-model:
+	go run ./cmd/eval --model
 
 clean:
 	rm -rf bin .run
