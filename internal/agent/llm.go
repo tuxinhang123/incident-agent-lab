@@ -46,6 +46,10 @@ func NewChatModel(ctx context.Context, cfg *ModelConfig) (cmodel.ChatModel, erro
 		APIKey:  cfg.APIKey,
 		BaseURL: cfg.BaseURL,
 		Model:   cfg.Model,
+		// Reasoning models (e.g. doubao-seed pro on Ark) default to "medium"
+		// reasoning and can spend 30s+ on hidden chain-of-thought. "low" keeps
+		// the structured diagnosis while keeping latency well under the timeout.
+		ReasoningEffort: openai.ReasoningEffortLevelLow,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create chat model: %w", err)

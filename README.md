@@ -10,17 +10,18 @@
 incident-agent-lab/
 ├── cmd/
 │   ├── demo-api/          # 被诊断的 Go 服务
-│   └── agent/             # Agent CLI（后续阶段）
+│   ├── agent/             # Agent CLI
+│   └── eval/              # 离线评测套件入口
 ├── internal/
-│   ├── agent/             # Agent 编排（后续阶段）
-│   ├── tools/             # 只读诊断工具（后续阶段）
-│   ├── model/             # 状态和结果结构（后续阶段）
+│   ├── agent/             # Agent 编排
+│   ├── tools/             # 只读诊断工具
+│   ├── model/             # 状态和结果结构
 │   └── rediskv/           # 最小 Redis 客户端
 ├── deploy/
 │   └── compose.yaml       # demo-api + redis
 ├── scripts/               # 本地（无 Docker）启停与验证脚本
 ├── scenarios/             # 故障注入和预期结果
-├── evals/                 # 评测代码与数据
+├── evals/                 # 评测套件（Case 定义、环境编排、合成靶标）
 ├── runbooks/              # 故障处理文档
 └── docs/
     └── architecture.md
@@ -130,6 +131,31 @@ export COZELOOP_WORKSPACE_ID=<workspace id>
 
 trace 结构：根 span `incident.diagnose`（type `workflow`）→ 6 个固定工具子 span（type `tool`，含入参、信封输出、失败状态码）→ 启用模型时一个 `diagnose.llm` span（type `model`，含 model_name、prompt/completion tokens、校验回退标记）。未设置两个环境变量时追踪整体关闭（无网络请求、无凭证报错），诊断行为与审计 JSONL 不受影响。
 
+## 离线评测套件（Day 5）
+
+`make eval` 自动完成"准备环境 → 注入故障 → 运行 `agent diagnose` → 断言根因 → 恢复"的完整闭环，并对 5 个 Case 逐一评测，结果落盘为 JSON 报告。评测进程会剥离 `OPENAI_*` / `COZELOOP_*` 环境变量，固定走确定性规则诊断器，保证无 API Key、可重复。
+
+| Case | 故障注入 | 预期 status | 预期 root_cause | 模式 |
+|------|----------|-------------|-----------------|------|
+| `healthy` | 无故障基线 | `no_incident` | `no_incident` | docker / local |
+| `redis_stopped` | 停止 Redis（/ready 503 + /api/data 500） | `diagnosed` | `redis_not_running` | docker / local |
+| `app_stopped` | 停止 demo-api 容器（/health 不可达 + 容器 exited） | `diagnosed` | `app_stopped` | 仅 docker |
+| `endpoint_timeout` | blackhole 靶标：接受 TCP 连接但永不响应 | `diagnosed` | `app_endpoint_timeout` | docker / local |
+| `ambiguous_signals` | 固定返回 404 的靶标，信号不匹配任何规则 | `insufficient_evidence` | `unknown` | docker / local |
+
+```bash
+make eval                                    # go run ./cmd/eval，自动选择 Docker 或本地
+go run ./cmd/eval --mode local               # 强制本地模式（app_stopped 记为 SKIP）
+go run ./cmd/eval --case redis_stopped       # 只跑单个 Case
+go run ./cmd/eval --keep                     # 结束后保留环境便于排查
+```
+
+评测套件用 Go 实现（`cmd/eval` 入口 + `evals/` 包），与仓库同语言、无 Python 依赖：Case 是 [evals/cases.go](evals/cases.go) 中带类型的结构体，预期根因/状态直接引用 `internal/model` 的常量（如 `model.CauseRedisNotRunning`），不可能与 Agent 的枚举漂移；环境编排（[stack.go](evals/stack.go)）负责构建 `bin/agent`、起停栈与故障注入；合成靶标（[faulttarget.go](evals/faulttarget.go)）用标准库 `net` 实现 blackhole 与固定状态码服务。评测始终执行**真实的 `bin/agent diagnose` 二进制**做端到端验证，而不是直接调用内部函数。
+
+每个 Case 的原始 Agent Report、汇总结果写入 `.run/evals/`（`results-latest.json` 为最新报告，另有时间戳副本）。断言字段为 `diagnosis.status`、`diagnosis.root_cause`、`diagnosis_source=rules`；任一 Case FAIL/ERROR 时退出码非 0，SKIP 不计失败。
+
+docker 模式使用独立 project（`ial-eval-<随机后缀>`）与运行时随机选择的空闲端口（compose 文件动态生成在 `.run/evals/compose.eval.yaml`，Redis 不发布宿主端口），不会与 `make up` 的 18080/6379 冲突；local 模式同样通过 `HTTP_PORT`/`REDIS_PORT` 选用随机端口，与本机其他服务隔离。
+
 ## 无 Docker 环境的本地方式
 
 需要本机已安装 Go 和 redis-server：
@@ -151,8 +177,8 @@ make test
 - Day 1：Go 服务 + Redis + Compose，稳定复现"Redis 停止"故障
 - Day 2：三个只读诊断工具（容器状态、日志聚合、HTTP 检查）+ CLI 与调用审计
 - Day 3：接入 Eino——工具注册为 InvokableTool，ChatModel（OpenAI 兼容）+ 证据规则校验，无 Key 时确定性规则诊断
-- Day 4（当前）：固定工作流经 compose.ToolsNode 编排执行（工具不可由模型选择），Report 输出逐步执行轨迹 trace
-- Day 5：5 个离线评测 Case
+- Day 4：固定工作流经 compose.ToolsNode 编排执行（工具不可由模型选择），Report 输出逐步执行轨迹 trace
+- Day 5（当前）：5 个离线评测 Case，`make eval` 自动准备环境、注入故障并输出 JSON 评测报告
 - Day 6-7：运行可观测性（Run ID/工具轨迹审计已有）、文档与演示
 
 详见 [docs/architecture.md](docs/architecture.md)。

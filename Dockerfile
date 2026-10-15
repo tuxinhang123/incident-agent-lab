@@ -1,4 +1,8 @@
 FROM golang:1.25-alpine AS build
+# GOPROXY 默认为国内镜像，避免 proxy.golang.org 超时；
+# 可通过 `docker build --build-arg GOPROXY=...` 或 compose args 覆盖。
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=$GOPROXY GOSUMDB=off
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download

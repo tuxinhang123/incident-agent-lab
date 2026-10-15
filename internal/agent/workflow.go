@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	cmodel "github.com/cloudwego/eino/components/model"
@@ -58,7 +60,7 @@ func Run(ctx context.Context, runID string, cfg TargetConfig, chat cmodel.ChatMo
 	}
 
 	if chat != nil {
-		d, ok := diagnoseWithModelTraced(ctx, tr, chat, modelName, collected.Evidence)
+		d, ok := diagnoseWithModelTraced(tr, chat, modelName, collected.Evidence)
 		if ok && d != nil {
 			report.Diagnosis = d
 			report.DiagnosisSource = "model"
@@ -81,19 +83,33 @@ func Run(ctx context.Context, runID string, cfg TargetConfig, chat cmodel.ChatMo
 
 // diagnoseWithModelTraced wraps the optional LLM call in a Coze Loop
 // "model" span carrying prompt/output and token usage when present.
-func diagnoseWithModelTraced(ctx context.Context, tr observability.Tracer, chat cmodel.ChatModel, modelName string, ev *diagmodel.CollectedEvidence) (*diagmodel.Diagnosis, bool) {
+func diagnoseWithModelTraced(tr observability.Tracer, chat cmodel.ChatModel, modelName string, ev *diagmodel.CollectedEvidence) (*diagmodel.Diagnosis, bool) {
 	rawEvidence := mustJSON(ev)
 	messages := []*schema.Message{
 		schema.SystemMessage(diagnoseSystemPrompt),
 		schema.UserMessage("Collected evidence JSON:\n" + string(rawEvidence)),
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, modelCallTimeout)
+	// Reasoning models may still take 15-30s on larger evidence sets even at
+	// "low" reasoning effort, so allow up to modelCallTimeout by default,
+	// overridable via MODEL_TIMEOUT.
+	timeout := modelCallTimeout
+	if v := os.Getenv("MODEL_TIMEOUT"); v != "" {
+		if d, perr := time.ParseDuration(v); perr == nil {
+			timeout = d
+		}
+	}
+	// Root the model call in a fresh, independently-budgeted context. The
+	// caller's ctx carries the whole-workflow deadline, whose remaining budget
+	// is already eaten into by evidence collection (container/log/HTTP probes),
+	// which would otherwise truncate a slow reasoning-model response.
+	callCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	if tr == nil {
 		out, err := chat.Generate(callCtx, messages)
 		if err != nil || out == nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to call model: %v\n", err)
 			return nil, false
 		}
 		d := parseModelDiagnosis(out.Content)
@@ -112,6 +128,7 @@ func diagnoseWithModelTraced(ctx context.Context, tr observability.Tracer, chat 
 	out, err := chat.Generate(spanCtx, messages)
 	if err != nil || out == nil {
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to call model: %v\n", err)
 			span.SetError(spanCtx, err)
 			span.SetStatusCode(spanCtx, 1)
 		}

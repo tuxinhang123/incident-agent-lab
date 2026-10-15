@@ -2,7 +2,7 @@ GO ?= go
 GOFLAGS_TEST := -p 1
 COMPOSE := docker compose -f deploy/compose.yaml
 
-.PHONY: build test vet tidy up down fault-inject fault-recover local-up local-down logs verify clean
+.PHONY: build test vet tidy up down fault-inject fault-recover local-up local-down logs verify eval clean
 
 build:
 	$(GO) build -o bin/demo-api ./cmd/demo-api
@@ -40,6 +40,11 @@ local-down:
 
 verify:
 	bash scripts/verify.sh
+
+# Day 5 offline eval suite: 5 cases with automatic env prep, fault
+# injection and a JSON report under .run/evals/.
+eval:
+	go run ./cmd/eval
 
 clean:
 	rm -rf bin .run
