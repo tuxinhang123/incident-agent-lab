@@ -51,7 +51,7 @@ func agentLoopTimeout() time.Duration {
 // the ChatModel itself is not mutated with BindTools. Tracing is bridged to
 // Coze Loop via an Eino callback handler attached through adk.WithCallbacks.
 func RunAgenticLoop(ctx context.Context, chat emodel.ChatModel, modelName string, cfg TargetConfig, audit AuditSink, tr observability.Tracer, runID string) (*diagmodel.Diagnosis, []TraceEntry, error) {
-	registered, err := AgentTools(cfg, audit, tr, runID)
+	registered, err := AgentTools(cfg, audit, runID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("register tools: %w", err)
 	}

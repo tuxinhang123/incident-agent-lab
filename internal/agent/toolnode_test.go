@@ -27,7 +27,7 @@ func TestFixedWorkflowToolNodeOrderAndEnvelopes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	registered, err := RegisteredTools()
+	registered, err := RegisteredTools(nil)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestFixedWorkflowToolNodeOrderAndEnvelopes(t *testing.T) {
 			}},
 	}
 
-	node, err := NewFixedWorkflowToolNode(context.Background(), base, steps, nil)
+	node, err := NewFixedWorkflowToolNode(context.Background(), base, steps)
 	if err != nil {
 		t.Fatalf("new node: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestFixedWorkflowToolNodeOrderAndEnvelopes(t *testing.T) {
 // TestNewFixedWorkflowToolNodeRejectsUnknownStep ensures a workflow step
 // cannot reference a tool that was not registered.
 func TestNewFixedWorkflowToolNodeRejectsUnknownStep(t *testing.T) {
-	registered, err := RegisteredTools()
+	registered, err := RegisteredTools(nil)
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestNewFixedWorkflowToolNodeRejectsUnknownStep(t *testing.T) {
 		base[i] = tl
 	}
 	steps := []ToolStep{{Name: "shell_exec", Arguments: map[string]any{}}}
-	if _, err := NewFixedWorkflowToolNode(context.Background(), base, steps, nil); err == nil {
+	if _, err := NewFixedWorkflowToolNode(context.Background(), base, steps); err == nil {
 		t.Fatal("unknown tool step must be rejected")
 	}
 }

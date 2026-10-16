@@ -134,8 +134,11 @@ func TestRunEmitsWorkflowToolAndModelSpans(t *testing.T) {
 	}
 }
 
-// TestRunToolSpansMarkFailure ensures a tool envelope failure marks the
-// span status non-zero without aborting the fixed sequence.
+// TestRunToolSpansMarkFailure ensures a tool envelope failure does not abort
+// the fixed sequence and that every step is recorded in the run trace.
+// Tool-level spans are no longer emitted by FixedWorkflowToolNode (the Eino
+// CozeLoop callback owns tool spans when present), so the assertions now
+// target the deterministic execution trace carried in the report.
 func TestRunToolSpansMarkFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
@@ -150,26 +153,36 @@ func TestRunToolSpansMarkFailure(t *testing.T) {
 	cfg.AppContainer = "ial-nonexistent-app"
 	cfg.RedisContainer = "ial-nonexistent-redis"
 	tr := &fakeTracer{}
-	if _, err := Run(context.Background(), "span-run2", cfg, nil, "", nil, tr); err != nil {
+	report, err := Run(context.Background(), "span-run2", cfg, nil, "", nil, tr)
+	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	var failedTools, finishedTools int
+	// The workflow root span must still be created and finished.
+	var roots int
 	for _, s := range tr.spans {
-		if s.spanType != spanTypeTool {
-			continue
+		if !s.finished {
+			t.Errorf("span %s not finished", s.name)
 		}
-		finishedTools++
-		if s.code != 0 {
-			failedTools++
+		if s.spanType == spanTypeWorkflow {
+			roots++
 		}
 	}
-	if finishedTools != 6 {
-		t.Fatalf("want 6 tool spans, got %d", finishedTools)
+	if roots != 1 {
+		t.Fatalf("want 1 workflow root span, got %d", roots)
+	}
+	if len(report.Trace) != 6 {
+		t.Fatalf("want 6 trace entries (all steps executed), got %d", len(report.Trace))
+	}
+	var failed int
+	for _, e := range report.Trace {
+		if !e.OK {
+			failed++
+		}
 	}
 	// docker-backed steps fail (query_service_logs + 2 containers); the 3
 	// HTTP steps pass.
-	if failedTools != 3 {
-		t.Fatalf("want 3 failed (logs + 2 containers) tool spans, got %d", failedTools)
+	if failed != 3 {
+		t.Fatalf("want 3 failed trace entries (logs + 2 containers), got %d", failed)
 	}
 }
 

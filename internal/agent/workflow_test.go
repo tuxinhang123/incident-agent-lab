@@ -90,7 +90,7 @@ func TestRunWorkflowHealthy(t *testing.T) {
 }
 
 func TestEinoToolRegistration(t *testing.T) {
-	tools, err := RegisteredTools()
+	tools, err := RegisteredTools(nil)
 	if err != nil {
 		t.Fatalf("register tools: %v", err)
 	}

@@ -65,7 +65,7 @@ func Run(ctx context.Context, runID string, cfg TargetConfig, chat cmodel.ChatMo
 		fmt.Fprintf(os.Stderr, "warning: agent loop did not produce a valid diagnosis (%v); falling back to rules\n", err)
 	}
 
-	collected, err := CollectEvidence(ctx, runID, cfg, audit, tr)
+	collected, err := CollectEvidence(ctx, runID, cfg, audit)
 	if err != nil {
 		if root != nil {
 			root.SetError(ctx, err)

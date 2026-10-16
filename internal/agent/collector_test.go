@@ -92,7 +92,7 @@ func TestBuildFixedStepsLogsTailKeyPropagation(t *testing.T) {
 // reachable: with tail_lines propagated correctly the tool returns an
 // invalid_input envelope instead of silently falling back to the default.
 func TestServiceLogsToolRejectsTailOverLimit(t *testing.T) {
-	tl, err := NewServiceLogsTool()
+	tl, err := NewServiceLogsTool(nil)
 	if err != nil {
 		t.Fatalf("register tool: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestCollectEvidenceDefaultPropagationAndAudit(t *testing.T) {
 	cfg := DefaultTarget()
 	cfg.BaseURL = srv.URL
 
-	res, err := CollectEvidence(context.Background(), "run-e2e", cfg, audit, nil)
+	res, err := CollectEvidence(context.Background(), "run-e2e", cfg, audit)
 	if err != nil {
 		t.Fatalf("collect: %v", err)
 	}

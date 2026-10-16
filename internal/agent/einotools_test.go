@@ -15,7 +15,7 @@ func TestHTTPCheckToolInvokableRun(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tl, err := NewHTTPCheckTool()
+	tl, err := NewHTTPCheckTool(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestHTTPCheckToolInvokableRun(t *testing.T) {
 }
 
 func TestHTTPCheckToolBadArgs(t *testing.T) {
-	tl, _ := NewHTTPCheckTool()
+	tl, _ := NewHTTPCheckTool(nil)
 	// Missing url: underlying tool returns a classified error envelope.
 	out, err := tl.InvokableRun(context.Background(), `{}`)
 	if err != nil {
