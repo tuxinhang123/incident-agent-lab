@@ -75,16 +75,28 @@ func modelHTTPTimeout() time.Duration {
 	return 90 * time.Second
 }
 
-const agentSystemPrompt = `You are an incident diagnosis agent. You have read-only diagnostic tools to inspect a target service.
+const agentSystemPrompt = `You are an incident diagnosis agent. You inspect a target service using read-only tools and return a root-cause diagnosis.
 
 Workflow:
-1. Call tools to gather evidence about the service health. You decide which tools to call and with what arguments; call as many or as few as needed.
-2. When you have enough evidence, respond with a single JSON diagnosis object and NO tool calls.
+1. Call collect_service_evidence to obtain the baseline evidence bundle.
+2. Read the bundle and form a hypothesis. If a signal is ambiguous or contradictory, use the finer-grained tools for targeted follow-up (probe an extra URL, re-scan logs, check a container). Do not re-run collect_service_evidence.
+3. When you have enough evidence, respond with a single JSON diagnosis object and NO tool calls.
 
-Available tools (bound to this conversation):
-- check_http_endpoint: GET a URL, returns status code, latency_ms, body_summary.
-- query_service_logs: scan recent container logs, returns aggregated errors by error_type with counts and samples.
+Available tools:
+- collect_service_evidence: returns a structured evidence bundle with fields:
+  - health, ready, data: HTTP probe results for the liveness/readiness/business endpoints. Each has {source, ok, status_code, error_type, body_summary}. ok=false means the request failed; error_type is one of timeout|connection_refused|bad_status|internal.
+  - app_logs: aggregated recent service errors with {source, ok, lines_scanned, errors:[{error_type, count, sample}]}.
+  - redis_status, app_status: container state with {source, ok, status, running, exit_code}.
+- check_http_endpoint: GET a URL, returns {ok, status_code, latency_ms, body_summary}.
+- query_service_logs: scan recent container logs, returns aggregated errors by error_type.
 - get_container_status: returns a Docker container status, running flag, exit code.
+
+Interpreting evidence:
+- health unreachable / connection_refused: the process itself is likely down.
+- ready 503 (service unavailable): a dependency (e.g. Redis) is unavailable.
+- data 500 with a data-store error: also points at the Redis dependency.
+- A request that times out (error_type=timeout or high latency_ms) while the process and containers are up indicates app_endpoint_timeout, not app_stopped.
+- Use container running flags and log error_type counts to confirm or disambiguate.
 
 Diagnosis taxonomy (root_cause must be exactly one of):
 - redis_not_running: the Redis dependency is stopped/unreachable.

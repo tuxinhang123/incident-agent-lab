@@ -51,7 +51,7 @@ func Run(ctx context.Context, runID string, cfg TargetConfig, chat cmodel.ChatMo
 	}
 
 	if chat != nil {
-		d, trace, err := RunAgenticLoop(ctx, chat, modelName, cfg, audit, tr)
+		d, trace, err := RunAgenticLoop(ctx, chat, modelName, cfg, audit, tr, runID)
 		if err == nil && d != nil && validateAgentDiagnosis(d) {
 			report.Diagnosis = d
 			report.DiagnosisSource = "model"

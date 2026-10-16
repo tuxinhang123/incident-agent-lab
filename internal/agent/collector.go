@@ -19,6 +19,26 @@ type TargetConfig struct {
 	RedisContainer string
 	HTTPTimeoutMS  int
 	LogTailLines   int
+	// Probes are the HTTP paths probed during baseline evidence collection,
+	// in order. Position 0 = liveness (-> Health), 1 = readiness (-> Ready),
+	// 2 = business (-> Data). The rule-based diagnoser consumes exactly these
+	// three roles; extra positions are reserved for future generalized
+	// evidence and ignored by rules. Empty falls back to DefaultProbes.
+	Probes []string
+}
+
+// Default probe paths for the V0 demo-api target. They are the default value
+// of TargetConfig.Probes; callers may override them to adapt to services with
+// different liveness/readiness/business endpoints.
+const (
+	PathHealth = "/health"
+	PathReady  = "/ready"
+	PathData   = "/api/data"
+)
+
+// DefaultProbes returns the default three-role probe path list.
+func DefaultProbes() []string {
+	return []string{PathHealth, PathReady, PathData}
 }
 
 // DefaultTarget returns the V0 Docker Compose target names.
@@ -29,7 +49,16 @@ func DefaultTarget() TargetConfig {
 		RedisContainer: "ial-redis",
 		HTTPTimeoutMS:  3000,
 		LogTailLines:   200,
+		Probes:         DefaultProbes(),
 	}
+}
+
+// probes returns the configured probe list, falling back to the defaults.
+func (c TargetConfig) probes() []string {
+	if len(c.Probes) == 0 {
+		return DefaultProbes()
+	}
+	return c.Probes
 }
 
 // AuditSink records every tool invocation. Record is called once per tool.
@@ -126,15 +155,20 @@ func buildFixedSteps(cfg TargetConfig, runID string, audit AuditSink) *fixedStep
 		})
 	}
 
-	httpStep("/health", cfg.BaseURL+"/health", func(o *model.HTTPCheckObservation, bag *observationBag) {
-		bag.health = o
-	})
-	httpStep("/ready", cfg.BaseURL+"/ready", func(o *model.HTTPCheckObservation, bag *observationBag) {
-		bag.ready = o
-	})
-	httpStep("/api/data", cfg.BaseURL+"/api/data", func(o *model.HTTPCheckObservation, bag *observationBag) {
-		bag.data = o
-	})
+	// Probes are bound to the three rule-consumed roles by position:
+	// 0 = liveness (Health), 1 = readiness (Ready), 2 = business (Data).
+	// Missing positions leave the corresponding observation nil.
+	roleSinks := []func(*model.HTTPCheckObservation, *observationBag){
+		func(o *model.HTTPCheckObservation, bag *observationBag) { bag.health = o },
+		func(o *model.HTTPCheckObservation, bag *observationBag) { bag.ready = o },
+		func(o *model.HTTPCheckObservation, bag *observationBag) { bag.data = o },
+	}
+	for i, path := range cfg.probes() {
+		if i >= len(roleSinks) {
+			break
+		}
+		httpStep(path, cfg.BaseURL+path, roleSinks[i])
+	}
 
 	{
 		started := nowFn()

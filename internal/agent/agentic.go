@@ -50,8 +50,8 @@ func agentLoopTimeout() time.Duration {
 // Tools are passed per request via the model.WithTools option (ADK convention);
 // the ChatModel itself is not mutated with BindTools. Tracing is bridged to
 // Coze Loop via an Eino callback handler attached through adk.WithCallbacks.
-func RunAgenticLoop(ctx context.Context, chat emodel.ChatModel, modelName string, cfg TargetConfig, audit AuditSink, tr observability.Tracer) (*diagmodel.Diagnosis, []TraceEntry, error) {
-	registered, err := RegisteredTools()
+func RunAgenticLoop(ctx context.Context, chat emodel.ChatModel, modelName string, cfg TargetConfig, audit AuditSink, tr observability.Tracer, runID string) (*diagmodel.Diagnosis, []TraceEntry, error) {
+	registered, err := AgentTools(cfg, audit, tr, runID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("register tools: %w", err)
 	}
@@ -78,8 +78,10 @@ func RunAgenticLoop(ctx context.Context, chat emodel.ChatModel, modelName string
 	runner := adk.NewRunner(ctx, adk.RunnerConfig{Agent: agt})
 
 	userMsg := fmt.Sprintf(
-		"Diagnose the health of service at %s. App container: %s, Redis container: %s. "+
-			"Use the available tools to gather evidence, then return your diagnosis as a JSON object.",
+		"Diagnose the health of the service at %s.\n\n"+
+			"App container: %s. Redis container: %s.\n"+
+			"Call collect_service_evidence first to get the baseline evidence bundle, "+
+			"use the other tools only for targeted follow-up, then return your diagnosis as a JSON object.",
 		cfg.BaseURL, cfg.AppContainer, cfg.RedisContainer,
 	)
 	input := []adk.Message{schema.UserMessage(userMsg)}

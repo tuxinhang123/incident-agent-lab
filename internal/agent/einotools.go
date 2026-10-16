@@ -7,14 +7,16 @@ import (
 	"github.com/cloudwego/eino/components/tool/utils"
 
 	"github.com/tuxinhang123/incident-agent-lab/internal/model"
+	"github.com/tuxinhang123/incident-agent-lab/internal/observability"
 	"github.com/tuxinhang123/incident-agent-lab/internal/tools"
 )
 
 // Tool names shared by the Eino registry, the workflow and evals.
 const (
-	ToolCheckHTTP    = "check_http_endpoint"
-	ToolServiceLogs  = "query_service_logs"
-	ToolContainerGet = "get_container_status"
+	ToolCheckHTTP       = "check_http_endpoint"
+	ToolServiceLogs     = "query_service_logs"
+	ToolContainerGet    = "get_container_status"
+	ToolCollectEvidence = "collect_service_evidence"
 )
 
 // Tool invocation envelopes: model-facing tools always return a structured
@@ -102,6 +104,45 @@ func RegisteredTools() ([]tool.InvokableTool, error) {
 		out = append(out, t)
 	}
 	return out, nil
+}
+
+// collectEvidenceInput is empty: the target is baked into the tool at
+// construction time so the model cannot misconfigure the baseline probes.
+type collectEvidenceInput struct{}
+
+// NewCollectEvidenceTool builds the collect_service_evidence tool. It is a
+// deterministic, coarse-grained tool that runs the same fixed evidence
+// collection the rule-based path uses (HTTP probes -> app logs -> container
+// status) and returns the full CollectedEvidence bundle. The model calls it
+// once for the baseline; the atomic tools remain available for targeted
+// follow-up.
+func NewCollectEvidenceTool(cfg TargetConfig, audit AuditSink, tr observability.Tracer, runID string) (tool.InvokableTool, error) {
+	return utils.InferTool(
+		ToolCollectEvidence,
+		"Collects a baseline evidence bundle for the configured target service: HTTP probe results for the liveness/readiness/business endpoints, aggregated service error logs, and app/redis container status. Returns a structured evidence object. Call this first before concluding; use the finer-grained tools only for targeted follow-up.",
+		func(ctx context.Context, _ collectEvidenceInput) (*toolEnvelope, error) {
+			collected, err := CollectEvidence(ctx, runID, cfg, audit, tr)
+			if err != nil {
+				return &toolEnvelope{OK: false, ErrorType: model.ErrorTypeInternal, ErrorMsg: err.Error()}, nil
+			}
+			return &toolEnvelope{OK: true, Result: collected.Evidence}, nil
+		},
+	)
+}
+
+// AgentTools returns the tools exposed to the ReAct agent: the deterministic
+// baseline evidence tool plus the atomic tools for targeted investigation.
+func AgentTools(cfg TargetConfig, audit AuditSink, tr observability.Tracer, runID string) ([]tool.InvokableTool, error) {
+	atomic, err := RegisteredTools()
+	if err != nil {
+		return nil, err
+	}
+	evidence, err := NewCollectEvidenceTool(cfg, audit, tr, runID)
+	if err != nil {
+		return nil, err
+	}
+	// Evidence tool first so it appears first in the tool list.
+	return append([]tool.InvokableTool{evidence}, atomic...), nil
 }
 
 func errorEnvelope(e *model.ToolError) *toolEnvelope {
